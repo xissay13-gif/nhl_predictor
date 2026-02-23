@@ -95,7 +95,7 @@ def compute_streak(game_log: pd.DataFrame, team: str) -> dict:
     """Current win/loss streak."""
     team_games = game_log[game_log["team"] == team].sort_values("date")
     if team_games.empty:
-        return {"streak_type": "N", "streak_count": 0}
+        return {"streak_type": "N", "streak_count": 0, "streak_value": 0}
 
     streak_type = None
     streak_count = 0
