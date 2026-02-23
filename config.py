@@ -40,7 +40,7 @@ class Config:
     rolling_window_short: int = 5
     rolling_window_long: int = 10
     elo_k_factor: float = 8.0
-    elo_home_advantage: float = 25.0
+    elo_home_advantage: float = 18.0
     elo_initial: float = 1500.0
     decay_factor: float = 0.75       # weight of last-season stats for cold start
     roster_continuity_weight: float = 0.8

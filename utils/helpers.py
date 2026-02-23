@@ -13,6 +13,14 @@ from typing import Optional
 logger = logging.getLogger("nhl_predictor")
 
 
+_DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
+
+
 def safe_request(
     url: str,
     params: Optional[dict] = None,
@@ -22,9 +30,10 @@ def safe_request(
     timeout: int = 30,
 ) -> Optional[requests.Response]:
     """HTTP GET with exponential backoff."""
+    merged = {**_DEFAULT_HEADERS, **(headers or {})}
     for attempt in range(retries):
         try:
-            resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+            resp = requests.get(url, params=params, headers=merged, timeout=timeout)
             resp.raise_for_status()
             return resp
         except requests.RequestException as exc:

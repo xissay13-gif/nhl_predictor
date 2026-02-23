@@ -206,16 +206,16 @@ def estimate_xg_from_features(features: dict) -> tuple[float, float]:
     home_xg = features.get("home_xgf_pg", 0)
     away_xg = features.get("away_xgf_pg", 0)
 
-    # Fallback: actual goals per game
+    # Fallback: actual goals per game (NHL 2024-25 average ~3.1)
     if home_xg == 0:
-        home_xg = features.get("home_gf_pg", 2.9)
+        home_xg = features.get("home_gf_pg", 3.1)
     if away_xg == 0:
-        away_xg = features.get("away_gf_pg", 2.9)
+        away_xg = features.get("away_gf_pg", 3.1)
 
     # Adjust for opponent defense
-    home_opp_xga = features.get("away_xga_pg", 2.9)
-    away_opp_xga = features.get("home_xga_pg", 2.9)
-    league_avg = 3.0
+    home_opp_xga = features.get("away_xga_pg", 3.1)
+    away_opp_xga = features.get("home_xga_pg", 3.1)
+    league_avg = 3.1
 
     # Opponent adjustment: if opponent allows more than average, scale up
     home_adj = home_xg * (home_opp_xga / league_avg)
@@ -229,8 +229,11 @@ def estimate_xg_from_features(features: dict) -> tuple[float, float]:
     home_final = 0.60 * home_xg + 0.25 * home_adj + 0.15 * home_rolling
     away_final = 0.60 * away_xg + 0.25 * away_adj + 0.15 * away_rolling
 
-    # Home advantage bump (~0.15 goals)
-    home_final += 0.15
+    # Home advantage bump — only when we have real team data (not defaults)
+    has_real_data = (features.get("home_xgf_pg", 0) > 0
+                     or features.get("home_gf_pg", 0) > 0)
+    if has_real_data:
+        home_final += 0.10  # ~0.1 goal home edge (NHL average is ~0.08-0.12)
 
     # Goalie adjustment
     home_sv = features.get("home_goalie_save_pct", 0.910)

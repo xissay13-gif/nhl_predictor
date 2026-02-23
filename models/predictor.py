@@ -389,9 +389,9 @@ class NHLPredictor:
 
     def _default_prediction(self) -> dict:
         return {
-            "ml_home_win_prob": 0.55,  # slight home advantage
-            "ml_away_win_prob": 0.45,
-            "ml_total_pred": 5.8,
-            "ml_home_cover_prob": 0.45,
-            "ml_away_cover_prob": 0.55,
+            "ml_home_win_prob": 0.50,  # neutral when untrained — Elo/Poisson add home edge
+            "ml_away_win_prob": 0.50,
+            "ml_total_pred": 6.0,
+            "ml_home_cover_prob": 0.47,
+            "ml_away_cover_prob": 0.53,
         }

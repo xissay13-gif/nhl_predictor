@@ -230,16 +230,19 @@ class ValueDetector:
             ))
 
         # Totals
-        total_line = market_data.get("market_total", 5.5)
+        total_line = market_data.get("market_total", 6.0)
         over_prob = poisson_predictions.get("over_prob", 0.5)
         under_prob = poisson_predictions.get("under_prob", 0.5)
-        # Adjust with blended total insight
-        if blended_total > total_line + 0.3:
-            over_prob = min(over_prob + 0.05, 0.95)
-            under_prob = max(under_prob - 0.05, 0.05)
-        elif blended_total < total_line - 0.3:
-            under_prob = min(under_prob + 0.05, 0.95)
-            over_prob = max(over_prob - 0.05, 0.05)
+        # Adjust with blended total insight — scale by how far off we are
+        diff = blended_total - total_line
+        if abs(diff) > 0.3:
+            adj = min(abs(diff) * 0.03, 0.05)  # max 5% adjustment
+            if diff > 0:
+                over_prob = min(over_prob + adj, 0.70)
+                under_prob = max(under_prob - adj, 0.30)
+            else:
+                under_prob = min(under_prob + adj, 0.70)
+                over_prob = max(over_prob - adj, 0.30)
 
         all_values.extend(self.analyze_total(
             over_prob, under_prob, total_line,
