@@ -282,6 +282,10 @@ class NHLPredictionPipeline:
                 "poisson_over_prob": poisson_pred.get("over_prob", 0.5),
                 "poisson_under_prob": poisson_pred.get("under_prob", 0.5),
                 "most_likely_score": poisson_pred.get("most_likely_scores", [{}])[0],
+                # Market odds
+                "best_home_odds": features.get("best_home_odds", 0),
+                "best_away_odds": features.get("best_away_odds", 0),
+                "reg_draw_prob": poisson_pred.get("regulation_draw_prob", 0),
                 # Elo
                 "home_elo": features.get("elo_home", cfg.elo_initial),
                 "away_elo": features.get("elo_away", cfg.elo_initial),
@@ -454,6 +458,16 @@ class NHLPredictionPipeline:
             print(f"  {'─'*50}")
             print(f"    Prediction:  {fav} ({fav_prob:.1%})")
             print(f"    Home:  {hwp:.1%}  |  Away:  {awp:.1%}")
+
+            # Market odds (P1 / X / P2)
+            ho = pred.get("best_home_odds", 0)
+            ao = pred.get("best_away_odds", 0)
+            draw_p = pred.get("reg_draw_prob", 0)
+            if ho and ao:
+                print(f"    Odds:  P1 {ho:+d}  |  X {draw_p:.1%}  |  P2 {ao:+d}")
+            elif draw_p:
+                print(f"    Reg Draw:  {draw_p:.1%}")
+
             print(f"    Expected Total:  {pred['expected_total']:.1f}")
             print(f"    Poisson xG:  {pred['poisson_home_xg']:.2f} — {pred['poisson_away_xg']:.2f}")
             print(f"    Elo:  {pred['home_elo']:.0f} vs {pred['away_elo']:.0f}")

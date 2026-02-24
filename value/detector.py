@@ -217,7 +217,7 @@ class ValueDetector:
         poisson_cover = poisson_predictions.get("cover_prob", 0.40)
         blended_cover = 0.55 * ml_cover + 0.45 * poisson_cover
 
-        # ── Collect all value opportunities ──────────────────────────
+        # ── Collect all value opportunities (moneyline only) ─────────
         all_values = []
 
         # Moneyline
@@ -228,33 +228,6 @@ class ValueDetector:
                 blended_home, blended_away, best_home, best_away,
                 home_team, away_team,
             ))
-
-        # Totals
-        total_line = market_data.get("market_total", 6.0)
-        over_prob = poisson_predictions.get("over_prob", 0.5)
-        under_prob = poisson_predictions.get("under_prob", 0.5)
-        # Adjust with blended total insight — scale by how far off we are
-        diff = blended_total - total_line
-        if abs(diff) > 0.3:
-            adj = min(abs(diff) * 0.03, 0.05)  # max 5% adjustment
-            if diff > 0:
-                over_prob = min(over_prob + adj, 0.70)
-                under_prob = max(under_prob - adj, 0.30)
-            else:
-                under_prob = min(under_prob + adj, 0.70)
-                over_prob = max(over_prob - adj, 0.30)
-
-        all_values.extend(self.analyze_total(
-            over_prob, under_prob, total_line,
-        ))
-
-        # Spread (-1.5 default puck line)
-        spread_value = self.analyze_spread(
-            blended_cover, -1.5, market_data.get("spread_odds", -110),
-            "home", home_team,
-        )
-        if spread_value:
-            all_values.append(spread_value)
 
         # Sort by edge descending
         all_values.sort(key=lambda x: x.get("edge_pct", 0), reverse=True)
