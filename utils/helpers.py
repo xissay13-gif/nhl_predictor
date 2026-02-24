@@ -6,6 +6,8 @@ import time
 import math
 import logging
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import pandas as pd
 from functools import wraps
 from typing import Optional
@@ -20,6 +22,23 @@ _DEFAULT_HEADERS = {
     ),
 }
 
+# Reusable session with connection pooling and urllib3-level retries
+_session = requests.Session()
+_session.headers.update(_DEFAULT_HEADERS)
+_retry = Retry(
+    total=3,
+    backoff_factor=1.0,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
+)
+_adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=10)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+
+# Timestamp of last request — used for rate limiting
+_last_request_time = 0.0
+_MIN_REQUEST_INTERVAL = 0.35  # seconds between requests
+
 
 def safe_request(
     url: str,
@@ -29,11 +48,19 @@ def safe_request(
     backoff: float = 2.0,
     timeout: int = 30,
 ) -> Optional[requests.Response]:
-    """HTTP GET with exponential backoff."""
+    """HTTP GET with exponential backoff, connection pooling, and rate limiting."""
+    global _last_request_time
+
+    # Rate limit: wait if too soon since last request
+    elapsed = time.monotonic() - _last_request_time
+    if elapsed < _MIN_REQUEST_INTERVAL:
+        time.sleep(_MIN_REQUEST_INTERVAL - elapsed)
+
     merged = {**_DEFAULT_HEADERS, **(headers or {})}
     for attempt in range(retries):
         try:
-            resp = requests.get(url, params=params, headers=merged, timeout=timeout)
+            _last_request_time = time.monotonic()
+            resp = _session.get(url, params=params, headers=merged, timeout=timeout)
             resp.raise_for_status()
             return resp
         except requests.RequestException as exc:
