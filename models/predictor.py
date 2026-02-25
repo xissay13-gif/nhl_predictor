@@ -115,7 +115,7 @@ class NHLPredictor:
         results_df: pd.DataFrame,
         calibrate: bool = True,
         feature_selection: bool = True,
-        top_n_features: int = 40,
+        top_n_features: int = 25,
     ):
         """
         Train all sub-models.
@@ -158,9 +158,20 @@ class NHLPredictor:
 
         logger.info("Training on %d games with %d features", len(X), len(self.feature_names))
 
+        # ── Early stopping split (last 15% as eval set) ──────────────
+        split_idx = int(len(X_scaled_df) * 0.85)
+        X_train_es = X_scaled_df.iloc[:split_idx]
+        X_eval_es = X_scaled_df.iloc[split_idx:]
+        y_win_tr, y_win_ev = y_win[:split_idx], y_win[split_idx:]
+        y_total_tr, y_total_ev = y_total[:split_idx], y_total[split_idx:]
+        y_spread_tr, y_spread_ev = y_spread[:split_idx], y_spread[split_idx:]
+
         # ── Win model ────────────────────────────────────────────────
         self.win_model = self._build_classifier("win")
-        self.win_model.fit(X_scaled_df, y_win)
+        self.win_model.fit(X_train_es, y_win_tr,
+                           eval_set=[(X_eval_es, y_win_ev)], verbose=False)
+        logger.info("Win model stopped at %d trees",
+                     getattr(self.win_model, "best_iteration", -1))
 
         if calibrate:
             self.win_model = CalibratedClassifierCV(
@@ -170,11 +181,17 @@ class NHLPredictor:
 
         # ── Total model ─────────────────────────────────────────────
         self.total_model = self._build_regressor("total")
-        self.total_model.fit(X_scaled_df, y_total)
+        self.total_model.fit(X_train_es, y_total_tr,
+                             eval_set=[(X_eval_es, y_total_ev)], verbose=False)
+        logger.info("Total model stopped at %d trees",
+                     getattr(self.total_model, "best_iteration", -1))
 
         # ── Spread model ─────────────────────────────────────────────
         self.spread_model = self._build_classifier("spread")
-        self.spread_model.fit(X_scaled_df, y_spread)
+        self.spread_model.fit(X_train_es, y_spread_tr,
+                              eval_set=[(X_eval_es, y_spread_ev)], verbose=False)
+        logger.info("Spread model stopped at %d trees",
+                     getattr(self.spread_model, "best_iteration", -1))
 
         if calibrate:
             self.spread_model = CalibratedClassifierCV(
@@ -227,7 +244,8 @@ class NHLPredictor:
             )
 
             clf = self._build_classifier("meta_oof")
-            clf.fit(X_tr_sc, y_train)
+            clf.fit(X_tr_sc, y_train,
+                    eval_set=[(X_vl_sc, y_win[val_idx])], verbose=False)
             ml_probs = clf.predict_proba(X_vl_sc)[:, 1]
 
             meta_features[val_idx, 0] = ml_probs
@@ -462,7 +480,6 @@ class NHLPredictor:
         y_win = results_df["home_win"].astype(int).values
 
         tscv = TimeSeriesSplit(n_splits=n_splits)
-        model = self._build_classifier("cv")
 
         accuracies = []
         log_losses_list = []
@@ -473,7 +490,9 @@ class NHLPredictor:
             y_train = y_win[train_idx]
             y_val = y_win[val_idx]
 
-            model.fit(X_train, y_train)
+            model = self._build_classifier("cv")
+            model.fit(X_train, y_train,
+                       eval_set=[(X_val, y_val)], verbose=False)
             proba = model.predict_proba(X_val)[:, 1]
             pred = (proba > 0.5).astype(int)
 
@@ -568,9 +587,10 @@ class NHLPredictor:
 
         if xgb is not None:
             defaults = dict(
-                n_estimators=300, max_depth=6, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.8, min_child_weight=3,
-                reg_alpha=0.1, reg_lambda=1.0,
+                n_estimators=1000, max_depth=4, learning_rate=0.03,
+                subsample=0.7, colsample_bytree=0.7, min_child_weight=5,
+                reg_alpha=0.3, reg_lambda=2.0, gamma=0.5,
+                early_stopping_rounds=30,
             )
             defaults.update(params)
             return xgb.XGBClassifier(
@@ -582,20 +602,21 @@ class NHLPredictor:
             )
         elif lgb is not None:
             defaults = dict(
-                n_estimators=300, max_depth=6, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.8, min_child_weight=3,
-                reg_alpha=0.1, reg_lambda=1.0,
+                n_estimators=1000, max_depth=4, learning_rate=0.03,
+                subsample=0.7, colsample_bytree=0.7, min_child_weight=5,
+                reg_alpha=0.3, reg_lambda=2.0,
             )
             defaults.update(params)
             return lgb.LGBMClassifier(
                 **defaults, random_state=42, verbose=-1,
+                callbacks=[lgb.early_stopping(30, verbose=False)],
             )
         else:
             from sklearn.ensemble import GradientBoostingClassifier
             logger.warning("Neither XGBoost nor LightGBM available — using sklearn GBM")
             return GradientBoostingClassifier(
-                n_estimators=200, max_depth=5, learning_rate=0.05,
-                subsample=0.8, random_state=42,
+                n_estimators=200, max_depth=4, learning_rate=0.03,
+                subsample=0.7, random_state=42,
             )
 
     def _build_regressor(self, name: str):
@@ -607,9 +628,10 @@ class NHLPredictor:
 
         if xgb is not None:
             defaults = dict(
-                n_estimators=250, max_depth=5, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
-                reg_alpha=0.1, reg_lambda=1.0,
+                n_estimators=1000, max_depth=4, learning_rate=0.03,
+                subsample=0.7, colsample_bytree=0.7, min_child_weight=5,
+                reg_alpha=0.3, reg_lambda=2.0, gamma=0.5,
+                early_stopping_rounds=20,
             )
             defaults.update(params)
             return xgb.XGBRegressor(
@@ -617,18 +639,20 @@ class NHLPredictor:
             )
         elif lgb is not None:
             defaults = dict(
-                n_estimators=250, max_depth=5, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.8,
+                n_estimators=1000, max_depth=4, learning_rate=0.03,
+                subsample=0.7, colsample_bytree=0.7, min_child_weight=5,
+                reg_alpha=0.3, reg_lambda=2.0,
             )
             defaults.update(params)
             return lgb.LGBMRegressor(
                 **defaults, random_state=42, verbose=-1,
+                callbacks=[lgb.early_stopping(20, verbose=False)],
             )
         else:
             from sklearn.ensemble import GradientBoostingRegressor
             return GradientBoostingRegressor(
-                n_estimators=200, max_depth=5, learning_rate=0.05,
-                subsample=0.8, random_state=42,
+                n_estimators=200, max_depth=4, learning_rate=0.03,
+                subsample=0.7, random_state=42,
             )
 
     def _compute_feature_importance(self):

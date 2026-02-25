@@ -56,14 +56,16 @@ class HyperparamTuner:
 
         def objective(trial):
             params = {
-                "n_estimators": trial.suggest_int("n_estimators", 100, 500, step=50),
-                "max_depth": trial.suggest_int("max_depth", 3, 8),
+                "n_estimators": 1000,  # early stopping finds the real optimum
+                "max_depth": trial.suggest_int("max_depth", 3, 5),
                 "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
-                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-                "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+                "subsample": trial.suggest_float("subsample", 0.5, 0.9),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 0.8),
+                "min_child_weight": trial.suggest_int("min_child_weight", 3, 15),
                 "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 1.0, log=True),
                 "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 5.0, log=True),
+                "gamma": trial.suggest_float("gamma", 0.0, 2.0),
+                "early_stopping_rounds": 30,
             }
 
             tscv = TimeSeriesSplit(n_splits=self.n_splits)
@@ -82,13 +84,17 @@ class HyperparamTuner:
                         verbosity=0,
                     )
                 elif lgb is not None:
+                    lgb_params = {k: v for k, v in params.items()
+                                  if k not in ("early_stopping_rounds", "gamma")}
                     model = lgb.LGBMClassifier(
-                        **params, random_state=42, verbose=-1,
+                        **lgb_params, random_state=42, verbose=-1,
+                        callbacks=[lgb.early_stopping(30, verbose=False)],
                     )
                 else:
                     return float("inf")
 
-                model.fit(X_train, y_train)
+                model.fit(X_train, y_train,
+                          eval_set=[(X_val, y_val)], verbose=False)
                 proba = model.predict_proba(X_val)[:, 1]
                 scores.append(log_loss(y_val, proba))
 
@@ -98,6 +104,9 @@ class HyperparamTuner:
         study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
         best = study.best_params
+        # Add fixed params that aren't tuned but needed for training
+        best["n_estimators"] = 1000
+        best["early_stopping_rounds"] = 30
         logger.info("Best classifier log_loss: %.4f", study.best_value)
         logger.info("Best params: %s", best)
         return best
@@ -113,14 +122,16 @@ class HyperparamTuner:
 
         def objective(trial):
             params = {
-                "n_estimators": trial.suggest_int("n_estimators", 100, 400, step=50),
-                "max_depth": trial.suggest_int("max_depth", 3, 7),
+                "n_estimators": 1000,  # early stopping finds the real optimum
+                "max_depth": trial.suggest_int("max_depth", 3, 5),
                 "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
-                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-                "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+                "subsample": trial.suggest_float("subsample", 0.5, 0.9),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 0.8),
+                "min_child_weight": trial.suggest_int("min_child_weight", 3, 15),
                 "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 1.0, log=True),
                 "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 5.0, log=True),
+                "gamma": trial.suggest_float("gamma", 0.0, 2.0),
+                "early_stopping_rounds": 20,
             }
 
             tscv = TimeSeriesSplit(n_splits=self.n_splits)
@@ -135,13 +146,17 @@ class HyperparamTuner:
                         **params, random_state=42, verbosity=0,
                     )
                 elif lgb is not None:
+                    lgb_params = {k: v for k, v in params.items()
+                                  if k not in ("early_stopping_rounds", "gamma")}
                     model = lgb.LGBMRegressor(
-                        **params, random_state=42, verbose=-1,
+                        **lgb_params, random_state=42, verbose=-1,
+                        callbacks=[lgb.early_stopping(20, verbose=False)],
                     )
                 else:
                     return float("inf")
 
-                model.fit(X_train, y_train)
+                model.fit(X_train, y_train,
+                          eval_set=[(X_val, y_val)], verbose=False)
                 preds = model.predict(X_val)
                 scores.append(mean_absolute_error(y_val, preds))
 
@@ -151,6 +166,9 @@ class HyperparamTuner:
         study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
         best = study.best_params
+        # Add fixed params that aren't tuned but needed for training
+        best["n_estimators"] = 1000
+        best["early_stopping_rounds"] = 20
         logger.info("Best regressor MAE: %.4f", study.best_value)
         logger.info("Best params: %s", best)
         return best
