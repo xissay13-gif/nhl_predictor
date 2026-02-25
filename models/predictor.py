@@ -174,6 +174,9 @@ class NHLPredictor:
                      getattr(self.win_model, "best_iteration", -1))
 
         if calibrate:
+            # Disable early stopping before calibration — CalibratedClassifierCV
+            # re-fits internally without eval_set, which would crash
+            self.win_model.set_params(early_stopping_rounds=None)
             self.win_model = CalibratedClassifierCV(
                 self.win_model, cv=3, method="isotonic"
             )
@@ -194,6 +197,7 @@ class NHLPredictor:
                      getattr(self.spread_model, "best_iteration", -1))
 
         if calibrate:
+            self.spread_model.set_params(early_stopping_rounds=None)
             self.spread_model = CalibratedClassifierCV(
                 self.spread_model, cv=3, method="isotonic"
             )
