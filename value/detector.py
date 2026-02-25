@@ -32,9 +32,11 @@ class ValueDetector:
         self,
         min_edge_pct: float = cfg.min_edge_pct,
         kelly_frac: float = cfg.kelly_fraction,
+        predictor=None,
     ):
         self.min_edge = min_edge_pct / 100.0
         self.kelly_frac = kelly_frac
+        self.predictor = predictor  # NHLPredictor instance for meta-model blending
 
     def analyze_moneyline(
         self,
@@ -200,9 +202,13 @@ class ValueDetector:
         # ── Blend ML + Poisson for final probabilities ───────────────
         ml_home = model_predictions.get("ml_home_win_prob", 0.5)
         poisson_home = poisson_predictions.get("home_win_prob", 0.5)
+        elo_home = model_predictions.get("elo_home_win_prob", 0.5)
 
-        # Weighted blend: 60% ML, 40% Poisson
-        blended_home = 0.60 * ml_home + 0.40 * poisson_home
+        # Use meta-model if available, otherwise fixed 60/40
+        if self.predictor is not None and hasattr(self.predictor, "blend_predictions"):
+            blended_home = self.predictor.blend_predictions(ml_home, poisson_home, elo_home)
+        else:
+            blended_home = 0.60 * ml_home + 0.40 * poisson_home
         blended_away = 1.0 - blended_home
 
         # Total: blend ML predicted total with Poisson expected total

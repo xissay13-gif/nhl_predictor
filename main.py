@@ -8,6 +8,9 @@ Usage:
   python main.py evaluate                       Evaluate model performance
   python main.py elo                            Show current Elo rankings
   python main.py value [--date YYYY-MM-DD]      Find value bets
+  python main.py shap                           Show SHAP feature importance
+  python main.py tune [--trials 100]            Tune hyperparameters with Optuna
+  python main.py track                          Show prediction tracking report
 """
 
 import sys
@@ -48,6 +51,9 @@ from features.engineer import FeatureEngineer
 # Value
 from value.detector import ValueDetector, format_value_report
 
+# Tracking
+from tracking.tracker import PredictionTracker
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -70,7 +76,8 @@ class NHLPredictionPipeline:
         self.elo = EloSystem()
         self.predictor = NHLPredictor()
         self.engineer = FeatureEngineer(elo_system=self.elo)
-        self.value_detector = ValueDetector()
+        self.value_detector = ValueDetector(predictor=self.predictor)
+        self.tracker = PredictionTracker()
 
         # Cached data
         self._standings = None
@@ -243,6 +250,9 @@ class NHLPredictionPipeline:
 
             # ML prediction
             ml_pred = self.predictor.predict(features)
+
+            # Pass Elo prob through for meta-model blending
+            ml_pred["elo_home_win_prob"] = features.get("elo_home_win_prob", 0.5)
 
             # Poisson prediction
             home_xg, away_xg = estimate_xg_from_features(features)
@@ -433,6 +443,89 @@ class NHLPredictionPipeline:
         self.predictor.save()
         logger.info("Model saved")
 
+    def _prepare_training_data(self, seasons: list[str] = None):
+        """Prepare training data and return (features_df, results_df). Used by tune."""
+        if seasons is None:
+            seasons = [cfg.previous_season]
+
+        all_features = []
+        all_results = []
+
+        for season in seasons:
+            season_year = season[:4]
+            logger.info("Preparing data for season %s...", season)
+
+            prev_standings = get_standings()
+            prev_mp = get_team_xg_summary(season_year)
+            prev_goalies_df = get_goalie_5v5(season_year)
+            prev_skaters = get_skater_stats(season_year)
+
+            goalie_lookup = {}
+            if not prev_goalies_df.empty:
+                team_col = "team" if "team" in prev_goalies_df.columns else prev_goalies_df.columns[0]
+                for team in prev_goalies_df[team_col].unique():
+                    tg = prev_goalies_df[prev_goalies_df[team_col] == team]
+                    gp_col = None
+                    for c in ("games_played", "gamesPlayed", "GP"):
+                        if c in tg.columns:
+                            gp_col = c
+                            break
+                    if gp_col and not tg.empty:
+                        best = tg.sort_values(gp_col, ascending=False).iloc[0]
+                        goalie_lookup[team] = best.to_dict()
+
+            teams = list(cfg.team_abbrevs.keys())
+            logs = []
+            for team in teams:
+                gl = get_team_game_log(team, season)
+                if not gl.empty:
+                    logs.append(gl)
+
+            if not logs:
+                continue
+
+            combined = pd.concat(logs, ignore_index=True)
+            combined["date"] = pd.to_datetime(combined["date"])
+            combined = combined.sort_values("date").reset_index(drop=True)
+
+            train_elo = EloSystem()
+            train_engineer = FeatureEngineer(elo_system=train_elo)
+
+            home_games = combined[combined["is_home"]].copy()
+            home_games = home_games.sort_values("date")
+
+            for idx, row in home_games.iterrows():
+                home = row["team"]
+                away = row["opponent"]
+                game_date = row["date"].strftime("%Y-%m-%d")
+                past_log = combined[combined["date"] < row["date"]]
+
+                if len(past_log) < 50:
+                    train_elo.update(home, away, int(row["goals_for"]),
+                                     int(row["goals_against"]), bool(row.get("ot", False)))
+                    continue
+
+                features = train_engineer.build_features(
+                    home_team=home, away_team=away, game_date=game_date,
+                    standings=prev_standings, game_log=past_log,
+                    mp_team_data=prev_mp, goalie_data=goalie_lookup,
+                    skaters_df=prev_skaters,
+                )
+                all_features.append(features)
+                all_results.append({
+                    "home_win": row["goals_for"] > row["goals_against"],
+                    "total_goals": row["goals_for"] + row["goals_against"],
+                    "home_covered": (row["goals_for"] - row["goals_against"]) >= 2,
+                })
+
+                train_elo.update(home, away, int(row["goals_for"]),
+                                 int(row["goals_against"]), bool(row.get("ot", False)))
+
+        if not all_features:
+            return None, None
+
+        return pd.DataFrame(all_features), pd.DataFrame(all_results)
+
     # ── Output ───────────────────────────────────────────────────────
 
     def print_predictions(self, predictions: list[dict]):
@@ -541,6 +634,19 @@ def main():
     val_parser = subparsers.add_parser("value", help="Find value bets")
     val_parser.add_argument("--date", type=str, default=None, help="Date YYYY-MM-DD")
 
+    # shap
+    subparsers.add_parser("shap", help="Show SHAP feature importance")
+
+    # tune
+    tune_parser = subparsers.add_parser("tune", help="Tune hyperparameters with Optuna")
+    tune_parser.add_argument("--trials", type=int, default=100,
+                             help="Number of Optuna trials (default: 100)")
+    tune_parser.add_argument("--seasons", type=str, default=None,
+                             help="Comma-separated seasons for tuning data")
+
+    # track
+    subparsers.add_parser("track", help="Show prediction tracking report")
+
     args = parser.parse_args()
 
     pipeline = NHLPredictionPipeline()
@@ -561,6 +667,9 @@ def main():
 
         predictions = pipeline.predict_games(args.date)
         pipeline.print_predictions(predictions)
+
+        # Log predictions for tracking
+        pipeline.tracker.log_predictions(predictions)
 
     elif args.command == "elo":
         pipeline.load_data()
@@ -594,6 +703,60 @@ def main():
         # Summary
         total_vb = sum(p.get("total_value_bets", 0) for p in predictions)
         print(f"\nTotal value bets found: {total_vb} across {len(predictions)} games\n")
+
+        # Log predictions for tracking
+        pipeline.tracker.log_predictions(predictions)
+
+    elif args.command == "shap":
+        # Load model and show SHAP report
+        try:
+            pipeline.predictor.load()
+            report = pipeline.predictor.get_shap_report()
+            print(report)
+        except FileNotFoundError:
+            logger.error("No trained model. Run 'train' first.")
+
+    elif args.command == "tune":
+        from models.tuner import HyperparamTuner
+        from models.predictor import _prepare_features
+
+        seasons = args.seasons.split(",") if args.seasons else None
+        logger.info("Preparing training data for hyperparameter tuning...")
+
+        features_df, results_df = pipeline._prepare_training_data(seasons)
+        if features_df is None:
+            logger.error("No training data available for tuning")
+            return
+
+        X, feature_names = _prepare_features(features_df)
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=feature_names)
+
+        y_win = results_df["home_win"].astype(int).values
+        y_total = results_df["total_goals"].values
+
+        tuner = HyperparamTuner()
+
+        # Tune classifier
+        clf_params = tuner.tune_classifier(X_scaled, y_win, n_trials=args.trials)
+
+        # Tune regressor
+        reg_params = tuner.tune_regressor(X_scaled, y_total, n_trials=max(args.trials // 2, 20))
+
+        # Save params
+        tuner.save_params(clf_params, reg_params)
+
+        print(f"\nBest classifier params: {clf_params}")
+        print(f"Best regressor params:  {reg_params}")
+        print(f"\nParams saved. Run 'train' to retrain with optimized parameters.\n")
+
+    elif args.command == "track":
+        logger.info("Updating prediction results...")
+        updated = pipeline.tracker.update_results()
+        if updated:
+            logger.info("Updated %d game results", updated)
+        pipeline.tracker.print_report()
 
     elif args.command == "evaluate":
         pipeline.load_data()
