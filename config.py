@@ -13,7 +13,7 @@ load_dotenv()
 @dataclass
 class Config:
     # ── API Keys ──────────────────────────────────────────────────────
-    odds_api_key: str = os.environ.get("ODDS_API_KEY", "")
+    odds_api_key: str = os.environ.get("ODDS_API_KEY", "33ed5104dc3b3ea06626772f7426d5cb")
 
     # ── NHL Edge API ──────────────────────────────────────────────────
     nhl_base_url: str = "https://api-web.nhle.com/v1"

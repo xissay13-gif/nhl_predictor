@@ -8,6 +8,7 @@ Docs: https://the-odds-api.com/liveapi/guides/v4/
 """
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
@@ -20,8 +21,9 @@ logger = logging.getLogger("nhl_predictor.odds_api")
 BASE = cfg.odds_base_url
 
 
-def _get_odds(markets: str = "h2h,spreads,totals", regions: str = "us,eu") -> list:
-    """Raw odds response from The Odds API."""
+def _get_odds(markets: str = "h2h,spreads,totals", regions: str = "us,eu",
+              target_date: str = None) -> list:
+    """Raw odds response from The Odds API, optionally filtered to a single date."""
     if not cfg.odds_api_key:
         logger.warning("ODDS_API_KEY not set — skipping odds fetch")
         return []
@@ -32,19 +34,26 @@ def _get_odds(markets: str = "h2h,spreads,totals", regions: str = "us,eu") -> li
         "markets": markets,
         "oddsFormat": "american",
     }
+
+    # Filter to a specific date window if provided
+    if target_date:
+        dt = datetime.strptime(target_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        params["commenceTimeFrom"] = dt.strftime("%Y-%m-%dT00:00:00Z")
+        params["commenceTimeTo"] = (dt + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+
     resp = safe_request(f"{BASE}/odds", params=params)
     if resp is None:
         return []
     return resp.json()
 
 
-def get_moneyline() -> pd.DataFrame:
+def get_moneyline(target_date: str = None) -> pd.DataFrame:
     """
     Moneyline odds for upcoming NHL games.
     Returns: game_id, home_team, away_team, bookmaker, home_odds, away_odds,
              home_implied, away_implied.
     """
-    events = _get_odds(markets="h2h")
+    events = _get_odds(markets="h2h", target_date=target_date)
     rows = []
     for ev in events:
         home = ev.get("home_team", "")
@@ -74,9 +83,9 @@ def get_moneyline() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def get_spreads() -> pd.DataFrame:
+def get_spreads(target_date: str = None) -> pd.DataFrame:
     """Puck line (spread) odds."""
-    events = _get_odds(markets="spreads")
+    events = _get_odds(markets="spreads", target_date=target_date)
     rows = []
     for ev in events:
         home = ev.get("home_team", "")
@@ -104,9 +113,9 @@ def get_spreads() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def get_totals() -> pd.DataFrame:
+def get_totals(target_date: str = None) -> pd.DataFrame:
     """Over/Under totals odds."""
-    events = _get_odds(markets="totals")
+    events = _get_odds(markets="totals", target_date=target_date)
     rows = []
     for ev in events:
         home = ev.get("home_team", "")
@@ -133,12 +142,12 @@ def get_totals() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def get_consensus_odds() -> pd.DataFrame:
+def get_consensus_odds(target_date: str = None) -> pd.DataFrame:
     """
     Aggregate consensus odds across bookmakers.
     Returns one row per game with mean implied probabilities and opening/closing.
     """
-    ml = get_moneyline()
+    ml = get_moneyline(target_date=target_date)
     if ml.empty:
         return pd.DataFrame()
 

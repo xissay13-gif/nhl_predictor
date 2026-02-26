@@ -222,9 +222,9 @@ class NHLPredictionPipeline:
 
         logger.info("Found %d games", len(upcoming))
 
-        # Get odds
-        consensus = get_consensus_odds()
-        totals_df = get_totals()
+        # Get odds (filtered to target date only)
+        consensus = get_consensus_odds(target_date=target_date)
+        totals_df = get_totals(target_date=target_date)
 
         results = []
 
