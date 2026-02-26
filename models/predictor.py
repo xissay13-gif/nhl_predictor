@@ -520,6 +520,119 @@ class NHLPredictor:
             "cv_log_loss_std": np.std(log_losses_list),
         }
 
+    def calibration_analysis(
+        self,
+        features_df: pd.DataFrame,
+        results_df: pd.DataFrame,
+        n_splits: int = 5,
+        n_bins: int = 10,
+    ) -> dict:
+        """
+        Out-of-fold calibration analysis using TimeSeriesSplit.
+
+        Returns dict with:
+          - oof_predictions: array of OOF predicted probabilities
+          - oof_actuals: array of actual outcomes
+          - calibration_bins: list of {bin_center, predicted_mean, actual_mean, count}
+          - ece: Expected Calibration Error
+          - mce: Maximum Calibration Error
+          - overconfidence: avg(predicted - actual) for bins where predicted > 0.5
+          - underconfidence: avg(actual - predicted) for bins where predicted < 0.5
+        """
+        X, feature_names = _prepare_features(features_df)
+
+        if self.selected_features:
+            use_features = [f for f in self.selected_features if f in X.columns]
+            if use_features:
+                X = X[use_features]
+                feature_names = use_features
+
+        y_win = results_df["home_win"].astype(int).values
+
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+
+        oof_probs = np.full(len(y_win), np.nan)
+
+        for train_idx, val_idx in tscv.split(X):
+            X_train_raw = X.iloc[train_idx]
+            X_val_raw = X.iloc[val_idx]
+            y_train = y_win[train_idx]
+
+            scaler_tmp = StandardScaler()
+            X_tr = pd.DataFrame(
+                scaler_tmp.fit_transform(X_train_raw), columns=feature_names
+            )
+            X_vl = pd.DataFrame(
+                scaler_tmp.transform(X_val_raw), columns=feature_names
+            )
+
+            model = self._build_classifier("calibration_oof")
+            model.fit(X_tr, y_train,
+                      eval_set=[(X_vl, y_win[val_idx])], verbose=False)
+            oof_probs[val_idx] = model.predict_proba(X_vl)[:, 1]
+
+        # Filter to rows with OOF predictions
+        valid = ~np.isnan(oof_probs)
+        probs = oof_probs[valid]
+        actuals = y_win[valid]
+
+        # Calibration bins
+        bin_edges = np.linspace(0, 1, n_bins + 1)
+        bins_data = []
+        for i in range(n_bins):
+            lo, hi = bin_edges[i], bin_edges[i + 1]
+            mask = (probs >= lo) & (probs < hi) if i < n_bins - 1 else (probs >= lo) & (probs <= hi)
+            count = mask.sum()
+            if count > 0:
+                pred_mean = probs[mask].mean()
+                actual_mean = actuals[mask].mean()
+            else:
+                pred_mean = (lo + hi) / 2
+                actual_mean = np.nan
+            bins_data.append({
+                "bin_low": lo,
+                "bin_high": hi,
+                "bin_center": (lo + hi) / 2,
+                "predicted_mean": pred_mean,
+                "actual_mean": actual_mean,
+                "count": int(count),
+            })
+
+        # ECE and MCE
+        total = len(probs)
+        ece = 0.0
+        mce = 0.0
+        for b in bins_data:
+            if b["count"] > 0 and not np.isnan(b["actual_mean"]):
+                gap = abs(b["predicted_mean"] - b["actual_mean"])
+                ece += (b["count"] / total) * gap
+                mce = max(mce, gap)
+
+        # Overconfidence / underconfidence analysis
+        over_gaps = []
+        under_gaps = []
+        for b in bins_data:
+            if b["count"] < 5 or np.isnan(b["actual_mean"]):
+                continue
+            if b["bin_center"] > 0.5:
+                over_gaps.append(b["predicted_mean"] - b["actual_mean"])
+            elif b["bin_center"] < 0.5:
+                under_gaps.append(b["actual_mean"] - b["predicted_mean"])
+
+        return {
+            "oof_predictions": probs,
+            "oof_actuals": actuals,
+            "calibration_bins": bins_data,
+            "ece": float(ece),
+            "mce": float(mce),
+            "overconfidence": float(np.mean(over_gaps)) if over_gaps else 0.0,
+            "underconfidence": float(np.mean(under_gaps)) if under_gaps else 0.0,
+            "total_oof_samples": int(len(probs)),
+            "oof_accuracy": float(accuracy_score(actuals, (probs > 0.5).astype(int))),
+            "oof_log_loss": float(log_loss(actuals, probs)),
+            "oof_brier": float(brier_score_loss(actuals, probs)),
+        }
+
     # ── Save / Load ───────────────────────────────────────────────────
 
     def save(self, path: Optional[str] = None):

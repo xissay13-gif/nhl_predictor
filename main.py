@@ -10,6 +10,7 @@ Usage:
   python main.py value [--date YYYY-MM-DD]      Find value bets
   python main.py shap                           Show SHAP feature importance
   python main.py tune [--trials 100]            Tune hyperparameters with Optuna
+  python main.py calibrate [--seasons ...]       Calibration analysis on OOF predictions
   python main.py track                          Show prediction tracking report
 """
 
@@ -644,6 +645,11 @@ def main():
     tune_parser.add_argument("--seasons", type=str, default=None,
                              help="Comma-separated seasons for tuning data")
 
+    # calibrate
+    cal_parser = subparsers.add_parser("calibrate", help="Calibration analysis on OOF predictions")
+    cal_parser.add_argument("--seasons", type=str, default=None,
+                            help="Comma-separated seasons for calibration data")
+
     # track
     subparsers.add_parser("track", help="Show prediction tracking report")
 
@@ -757,6 +763,85 @@ def main():
         if updated:
             logger.info("Updated %d game results", updated)
         pipeline.tracker.print_report()
+
+    elif args.command == "calibrate":
+        seasons = args.seasons.split(",") if args.seasons else None
+        logger.info("Preparing data for calibration analysis...")
+
+        features_df, results_df = pipeline._prepare_training_data(seasons)
+        if features_df is None:
+            logger.error("No training data available for calibration")
+            return
+
+        logger.info("Running OOF calibration analysis on %d games...", len(features_df))
+        cal = pipeline.predictor.calibration_analysis(features_df, results_df)
+
+        # Print report
+        print(f"\n{'='*65}")
+        print("  CALIBRATION ANALYSIS (Out-of-Fold Predictions)")
+        print(f"{'='*65}\n")
+
+        print(f"  OOF Samples:   {cal['total_oof_samples']}")
+        print(f"  OOF Accuracy:  {cal['oof_accuracy']:.1%}")
+        print(f"  OOF Log Loss:  {cal['oof_log_loss']:.4f}")
+        print(f"  OOF Brier:     {cal['oof_brier']:.4f}")
+
+        print(f"\n  ECE (Expected Calibration Error):  {cal['ece']:.4f}")
+        print(f"  MCE (Maximum Calibration Error):   {cal['mce']:.4f}")
+
+        if cal['overconfidence'] > 0.02:
+            print(f"  Overconfidence (high prob bins):    +{cal['overconfidence']:.1%}")
+        if cal['underconfidence'] > 0.02:
+            print(f"  Underconfidence (low prob bins):    +{cal['underconfidence']:.1%}")
+
+        print(f"\n  RELIABILITY TABLE")
+        print(f"  {'─'*60}")
+        print(f"  {'Bin':^12} {'Predicted':>10} {'Actual':>10} {'Gap':>8} {'N':>6}  {'Status'}")
+        print(f"  {'─'*60}")
+
+        for b in cal['calibration_bins']:
+            if b['count'] == 0:
+                continue
+            label = f"{b['bin_low']:.0%}-{b['bin_high']:.0%}"
+            pred = b['predicted_mean']
+            actual = b['actual_mean']
+            if np.isnan(actual):
+                print(f"  {label:^12} {pred:>10.1%} {'N/A':>10} {'':>8} {b['count']:>6}")
+            else:
+                gap = pred - actual
+                status = ""
+                if abs(gap) > 0.05:
+                    status = "OVERCONF" if gap > 0 else "UNDERCONF"
+                elif abs(gap) <= 0.02:
+                    status = "OK"
+                else:
+                    status = "~ok"
+                print(f"  {label:^12} {pred:>10.1%} {actual:>10.1%} {gap:>+8.1%} {b['count']:>6}  {status}")
+
+        # Recommendation
+        print(f"\n  RECOMMENDATION FOR VALUE BETTING")
+        print(f"  {'─'*60}")
+        ece = cal['ece']
+        overconf = cal['overconfidence']
+
+        if ece < 0.03:
+            print("  Calibration: EXCELLENT (ECE < 3%)")
+            print("  -> Safe to use min_edge 3% threshold")
+        elif ece < 0.05:
+            print("  Calibration: GOOD (ECE < 5%)")
+            print("  -> Recommended min_edge 5% to compensate for calibration noise")
+        elif ece < 0.08:
+            print("  Calibration: FAIR (ECE < 8%)")
+            print("  -> Recommended min_edge 6-8% — model probabilities have notable gaps")
+        else:
+            print("  Calibration: POOR (ECE >= 8%)")
+            print("  -> NOT recommended for value betting — retrain with isotonic calibration")
+
+        if overconf > 0.05:
+            print(f"  WARNING: Model is overconfident by ~{overconf:.1%} in high-prob bins")
+            print("  -> Value detector may find FALSE edges on favorites")
+
+        print(f"\n{'='*65}\n")
 
     elif args.command == "evaluate":
         pipeline.load_data()
