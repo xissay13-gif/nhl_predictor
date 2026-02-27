@@ -204,9 +204,12 @@ class ValueDetector:
         poisson_home = poisson_predictions.get("home_win_prob", 0.5)
         elo_home = model_predictions.get("elo_home_win_prob", 0.5)
 
-        # Use meta-model if available, otherwise fixed 60/40
+        # Use enhanced meta-model if available (with context features)
+        meta_context = model_predictions.get("meta_context", None)
         if self.predictor is not None and hasattr(self.predictor, "blend_predictions"):
-            blended_home = self.predictor.blend_predictions(ml_home, poisson_home, elo_home)
+            blended_home = self.predictor.blend_predictions(
+                ml_home, poisson_home, elo_home, context=meta_context
+            )
         else:
             blended_home = 0.60 * ml_home + 0.40 * poisson_home
         blended_away = 1.0 - blended_home

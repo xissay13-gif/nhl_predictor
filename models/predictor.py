@@ -1,12 +1,13 @@
 """
 Main ML Prediction Model.
 
-Ensemble of XGBoost and LightGBM for:
+Ensemble of XGBoost, LightGBM, and CatBoost for:
   1. Win probability (classification)
   2. Goal totals (regression)
   3. Spread/puck line (classification)
 
-Includes SHAP feature selection, stacking meta-model, and Optuna param loading.
+Includes SHAP feature selection, stacking meta-model, sample weighting,
+top_n_features optimization, and Optuna param loading.
 """
 
 import os
@@ -33,6 +34,11 @@ try:
     import lightgbm as lgb
 except ImportError:
     lgb = None
+
+try:
+    import catboost as cb
+except ImportError:
+    cb = None
 
 try:
     import shap
@@ -84,11 +90,21 @@ class NHLPredictor:
 
     Plus:
       - SHAP-based feature selection (top_n features)
-      - Stacking meta-model (learned blend of ML + Poisson + Elo)
+      - Automatic top_n_features optimization via grid search
+      - Stacking meta-model with context features (ML + Poisson + Elo + context)
+      - Exponential decay sample weighting (recent games matter more)
+      - CatBoost support alongside XGBoost / LightGBM
       - Optuna tuned params (loaded from best_params.json if available)
     """
 
-    def __init__(self):
+    # Available model engines
+    ENGINES = ("xgboost", "lightgbm", "catboost")
+
+    def __init__(self, engine: str = "auto"):
+        """
+        Args:
+            engine: "xgboost", "lightgbm", "catboost", or "auto" (best available).
+        """
         self.win_model = None
         self.total_model = None
         self.spread_model = None
@@ -96,16 +112,51 @@ class NHLPredictor:
         self.feature_names: list[str] = []
         self.selected_features: list[str] | None = None
         self.is_trained = False
+        self.engine = self._resolve_engine(engine)
 
         # Feature importance
         self.feature_importance: Optional[pd.DataFrame] = None
         self.shap_values_summary: Optional[pd.DataFrame] = None
 
-        # Meta-model for stacking
+        # Meta-model for stacking (enhanced with context features)
         self.meta_model: Optional[LogisticRegression] = None
+        self.meta_feature_names: list[str] = []  # track meta-model input columns
 
         # Tuned params
         self._tuned_params = self._load_tuned_params()
+
+    @staticmethod
+    def _resolve_engine(engine: str) -> str:
+        """Resolve 'auto' to the best available engine."""
+        if engine != "auto":
+            return engine
+        if xgb is not None:
+            return "xgboost"
+        if cb is not None:
+            return "catboost"
+        if lgb is not None:
+            return "lightgbm"
+        return "sklearn"
+
+    # ── Sample weighting ──────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_sample_weights(
+        n_samples: int,
+        half_life: int = 200,
+    ) -> np.ndarray:
+        """
+        Exponential decay weights: recent games get higher weight.
+
+        Games are assumed chronologically ordered (oldest first).
+        half_life: number of games after which weight halves
+                   (200 ≈ ~3 months of NHL games across all teams).
+        """
+        positions = np.arange(n_samples)
+        # Decay from oldest (0) to newest (n-1)
+        # w(i) = 2^((i - n + 1) / half_life)   → newest = 1.0, oldest decays
+        weights = np.power(2.0, (positions - n_samples + 1) / half_life)
+        return weights
 
     # ── Training ──────────────────────────────────────────────────────
 
@@ -116,6 +167,9 @@ class NHLPredictor:
         calibrate: bool = True,
         feature_selection: bool = True,
         top_n_features: int = 25,
+        auto_select_top_n: bool = True,
+        sample_weighting: bool = True,
+        weight_half_life: int = 200,
     ):
         """
         Train all sub-models.
@@ -125,6 +179,11 @@ class NHLPredictor:
             - home_win (bool): did home team win?
             - total_goals (int): total goals in the game
             - home_covered (bool): did home cover -1.5 spread?
+
+        New parameters:
+            auto_select_top_n: if True, grid-search for optimal top_n_features value
+            sample_weighting: if True, apply exponential decay sample weights
+            weight_half_life: half-life for sample weight decay (in games)
         """
         X_full, all_feature_names = _prepare_features(features_df)
 
@@ -132,8 +191,21 @@ class NHLPredictor:
         y_total = results_df["total_goals"].values
         y_spread = results_df["home_covered"].astype(int).values
 
+        # ── Sample weights (exponential decay by recency) ─────────────
+        sample_weights = None
+        if sample_weighting:
+            sample_weights = self._compute_sample_weights(len(y_win), half_life=weight_half_life)
+            logger.info("Sample weighting enabled (half_life=%d): oldest=%.3f, newest=%.3f",
+                        weight_half_life, sample_weights[0], sample_weights[-1])
+
         # ── SHAP Feature Selection ────────────────────────────────────
         if feature_selection and shap is not None and len(all_feature_names) > top_n_features:
+            # Auto-optimize top_n if requested
+            if auto_select_top_n:
+                top_n_features = self._optimize_top_n(
+                    X_full, y_win, all_feature_names, sample_weights
+                )
+
             logger.info("Running SHAP feature selection (from %d to %d)...",
                         len(all_feature_names), top_n_features)
             selected = self._shap_select(X_full, y_win, top_n=top_n_features)
@@ -156,7 +228,8 @@ class NHLPredictor:
         X_scaled = self.scaler.fit_transform(X)
         X_scaled_df = pd.DataFrame(X_scaled, columns=self.feature_names)
 
-        logger.info("Training on %d games with %d features", len(X), len(self.feature_names))
+        logger.info("Training on %d games with %d features (engine=%s)",
+                     len(X), len(self.feature_names), self.engine)
 
         # ── Early stopping split (last 15% as eval set) ──────────────
         split_idx = int(len(X_scaled_df) * 0.85)
@@ -165,65 +238,185 @@ class NHLPredictor:
         y_win_tr, y_win_ev = y_win[:split_idx], y_win[split_idx:]
         y_total_tr, y_total_ev = y_total[:split_idx], y_total[split_idx:]
         y_spread_tr, y_spread_ev = y_spread[:split_idx], y_spread[split_idx:]
+        sw_train = sample_weights[:split_idx] if sample_weights is not None else None
 
         # ── Win model ────────────────────────────────────────────────
         self.win_model = self._build_classifier("win")
-        self.win_model.fit(X_train_es, y_win_tr,
-                           eval_set=[(X_eval_es, y_win_ev)], verbose=False)
+        fit_kwargs = self._fit_kwargs(
+            self.win_model, X_eval_es, y_win_ev, sw_train
+        )
+        self.win_model.fit(X_train_es, y_win_tr, **fit_kwargs)
         logger.info("Win model stopped at %d trees",
-                     getattr(self.win_model, "best_iteration", -1))
+                     self._get_best_iteration(self.win_model))
 
         if calibrate:
-            # Fix n_estimators to early-stopped optimum so CalibratedClassifierCV
-            # re-fits with the same tree count (not all 1000)
-            best_iter = getattr(self.win_model, "best_iteration", None)
-            if best_iter and best_iter > 0:
-                self.win_model.set_params(n_estimators=best_iter,
-                                          early_stopping_rounds=None)
-            else:
-                self.win_model.set_params(early_stopping_rounds=None)
-            self.win_model = CalibratedClassifierCV(
-                self.win_model, cv=3, method="isotonic"
+            self.win_model = self._calibrate_model(
+                self.win_model, X_scaled_df, y_win, sample_weights
             )
-            self.win_model.fit(X_scaled_df, y_win)
 
         # ── Total model ─────────────────────────────────────────────
         self.total_model = self._build_regressor("total")
-        self.total_model.fit(X_train_es, y_total_tr,
-                             eval_set=[(X_eval_es, y_total_ev)], verbose=False)
+        fit_kwargs = self._fit_kwargs(
+            self.total_model, X_eval_es, y_total_ev, sw_train
+        )
+        self.total_model.fit(X_train_es, y_total_tr, **fit_kwargs)
         logger.info("Total model stopped at %d trees",
-                     getattr(self.total_model, "best_iteration", -1))
+                     self._get_best_iteration(self.total_model))
 
         # ── Spread model ─────────────────────────────────────────────
         self.spread_model = self._build_classifier("spread")
-        self.spread_model.fit(X_train_es, y_spread_tr,
-                              eval_set=[(X_eval_es, y_spread_ev)], verbose=False)
+        fit_kwargs = self._fit_kwargs(
+            self.spread_model, X_eval_es, y_spread_ev, sw_train
+        )
+        self.spread_model.fit(X_train_es, y_spread_tr, **fit_kwargs)
         logger.info("Spread model stopped at %d trees",
-                     getattr(self.spread_model, "best_iteration", -1))
+                     self._get_best_iteration(self.spread_model))
 
         if calibrate:
-            best_iter = getattr(self.spread_model, "best_iteration", None)
-            if best_iter and best_iter > 0:
-                self.spread_model.set_params(n_estimators=best_iter,
-                                             early_stopping_rounds=None)
-            else:
-                self.spread_model.set_params(early_stopping_rounds=None)
-            self.spread_model = CalibratedClassifierCV(
-                self.spread_model, cv=3, method="isotonic"
+            self.spread_model = self._calibrate_model(
+                self.spread_model, X_scaled_df, y_spread, sample_weights
             )
-            self.spread_model.fit(X_scaled_df, y_spread)
 
         self.is_trained = True
 
         # Feature importance (from the base estimator)
         self._compute_feature_importance()
 
-        # ── Train stacking meta-model ────────────────────────────────
-        self._train_meta_model(X_full, all_feature_names, y_win, features_df)
+        # ── Train stacking meta-model (enhanced) ─────────────────────
+        self._train_meta_model(X_full, all_feature_names, y_win, features_df,
+                               sample_weights=sample_weights)
 
         logger.info("Training complete")
 
+    # ── Top N feature optimization ─────────────────────────────────────
+
+    def _optimize_top_n(
+        self,
+        X_full: pd.DataFrame,
+        y_win: np.ndarray,
+        all_feature_names: list[str],
+        sample_weights: np.ndarray | None = None,
+        candidates: list[int] | None = None,
+    ) -> int:
+        """
+        Grid search over top_n_features values to find the one that
+        minimizes CV log loss.
+        """
+        if candidates is None:
+            candidates = [15, 20, 25, 30, 35, 40]
+
+        # Filter candidates to valid range
+        max_feats = len(all_feature_names)
+        candidates = [c for c in candidates if c < max_feats]
+        if not candidates:
+            return min(25, max_feats)
+
+        logger.info("Optimizing top_n_features from candidates %s...", candidates)
+
+        # Train a quick SHAP model to rank features once
+        shap_ranking = self._shap_select(X_full, y_win, top_n=max(candidates))
+        if not shap_ranking:
+            logger.warning("SHAP ranking failed — using default top_n=25")
+            return 25
+
+        best_n = candidates[0]
+        best_score = float("inf")
+
+        tscv = TimeSeriesSplit(n_splits=3)  # fewer folds for speed
+
+        for n in candidates:
+            features_subset = shap_ranking[:n]
+            X_sub = X_full[features_subset]
+
+            scores = []
+            for train_idx, val_idx in tscv.split(X_sub):
+                X_tr = X_sub.iloc[train_idx]
+                X_vl = X_sub.iloc[val_idx]
+                y_tr = y_win[train_idx]
+                y_vl = y_win[val_idx]
+
+                scaler_tmp = StandardScaler()
+                X_tr_s = pd.DataFrame(scaler_tmp.fit_transform(X_tr), columns=features_subset)
+                X_vl_s = pd.DataFrame(scaler_tmp.transform(X_vl), columns=features_subset)
+
+                model = self._build_classifier("topn_search")
+                sw = sample_weights[train_idx] if sample_weights is not None else None
+                fit_kw = self._fit_kwargs(model, X_vl_s, y_vl, sw)
+                model.fit(X_tr_s, y_tr, **fit_kw)
+                proba = model.predict_proba(X_vl_s)[:, 1]
+                scores.append(log_loss(y_vl, proba))
+
+            mean_ll = np.mean(scores)
+            logger.info("  top_n=%d → CV log_loss=%.4f", n, mean_ll)
+            if mean_ll < best_score:
+                best_score = mean_ll
+                best_n = n
+
+        logger.info("Optimal top_n_features = %d (log_loss=%.4f)", best_n, best_score)
+        return best_n
+
+    # ── Calibration helper ─────────────────────────────────────────────
+
+    def _calibrate_model(self, model, X_full, y, sample_weights=None):
+        """Calibrate a classifier using isotonic regression."""
+        best_iter = self._get_best_iteration(model)
+        if best_iter > 0:
+            model.set_params(n_estimators=best_iter)
+        # Disable early stopping for refit
+        self._disable_early_stopping(model)
+        cal = CalibratedClassifierCV(model, cv=3, method="isotonic")
+        cal.fit(X_full, y, sample_weight=sample_weights)
+        return cal
+
+    @staticmethod
+    def _get_best_iteration(model) -> int:
+        """Get best iteration from any boosting model."""
+        if hasattr(model, "best_iteration"):
+            return getattr(model, "best_iteration", -1) or -1
+        if hasattr(model, "best_iteration_"):
+            return getattr(model, "best_iteration_", -1) or -1
+        return -1
+
+    @staticmethod
+    def _disable_early_stopping(model):
+        """Disable early stopping for refit."""
+        if hasattr(model, "early_stopping_rounds"):
+            try:
+                model.set_params(early_stopping_rounds=None)
+            except Exception:
+                pass
+
+    def _fit_kwargs(self, model, X_eval, y_eval, sample_weights=None) -> dict:
+        """Build fit() kwargs appropriate for the model engine."""
+        kwargs: dict = {"verbose": False}
+
+        # CatBoost uses different API
+        if cb is not None and isinstance(model, (cb.CatBoostClassifier, cb.CatBoostRegressor)):
+            kwargs = {
+                "eval_set": (X_eval, y_eval),
+                "verbose": False,
+            }
+            if sample_weights is not None:
+                kwargs["sample_weight"] = sample_weights
+            return kwargs
+
+        # XGBoost / LightGBM
+        kwargs["eval_set"] = [(X_eval, y_eval)]
+        if sample_weights is not None:
+            kwargs["sample_weight"] = sample_weights
+        return kwargs
+
     # ── Stacking Meta-model ───────────────────────────────────────────
+
+    # ── Context columns for enhanced meta-model ─────────────────────
+
+    META_CONTEXT_COLS = [
+        "rest_diff",
+        "diff_momentum",
+        "market_home_true_prob",
+        "diff_win_pct",
+        "diff_goal_diff_pg",
+    ]
 
     def _train_meta_model(
         self,
@@ -231,18 +424,27 @@ class NHLPredictor:
         all_feature_names: list[str],
         y_win: np.ndarray,
         features_df: pd.DataFrame,
+        sample_weights: np.ndarray | None = None,
     ):
         """
-        Train a logistic regression meta-model on OOF predictions
-        from the ML model, Poisson xG, and Elo.
+        Train an enhanced logistic regression meta-model on OOF predictions
+        from the ML model, Poisson xG, Elo, PLUS context features
+        (rest_diff, momentum_diff, market_implied, win_pct_diff, goal_diff).
         """
-        logger.info("Training stacking meta-model...")
+        logger.info("Training enhanced stacking meta-model...")
 
         feature_cols = self.feature_names
         X_sel = X_full[feature_cols] if self.selected_features else X_full
 
+        # Determine which context cols are available
+        available_context = [c for c in self.META_CONTEXT_COLS if c in features_df.columns]
+
+        # Total meta features: 3 (ml, poisson, elo) + N context
+        n_meta = 3 + len(available_context)
+        self.meta_feature_names = ["ml_prob", "poisson_prob", "elo_prob"] + available_context
+
         tscv = TimeSeriesSplit(n_splits=5)
-        meta_features = np.full((len(y_win), 3), np.nan)
+        meta_features = np.full((len(y_win), n_meta), np.nan)
 
         for train_idx, val_idx in tscv.split(X_sel):
             X_train = X_sel.iloc[train_idx]
@@ -258,19 +460,18 @@ class NHLPredictor:
             )
 
             clf = self._build_classifier("meta_oof")
-            clf.fit(X_tr_sc, y_train,
-                    eval_set=[(X_vl_sc, y_win[val_idx])], verbose=False)
+            sw = sample_weights[train_idx] if sample_weights is not None else None
+            fit_kw = self._fit_kwargs(clf, X_vl_sc, y_win[val_idx], sw)
+            clf.fit(X_tr_sc, y_train, **fit_kw)
             ml_probs = clf.predict_proba(X_vl_sc)[:, 1]
 
             meta_features[val_idx, 0] = ml_probs
 
-        # Poisson & Elo from features_df
-        # Use xG-based estimate as Poisson proxy
-        for col_name, idx in [("elo_home_win_prob", 2)]:
-            if col_name in features_df.columns:
-                meta_features[:, idx] = features_df[col_name].fillna(0.5).values
-            else:
-                meta_features[:, idx] = 0.5
+        # Elo probabilities
+        if "elo_home_win_prob" in features_df.columns:
+            meta_features[:, 2] = features_df["elo_home_win_prob"].fillna(0.5).values
+        else:
+            meta_features[:, 2] = 0.5
 
         # Poisson proxy: use xG features if available
         xgf_col = None
@@ -280,31 +481,38 @@ class NHLPredictor:
                 break
         if xgf_col:
             xg_vals = features_df[xgf_col].fillna(0).values
-            # Rough sigmoid to convert xG diff to probability
             meta_features[:, 1] = 1.0 / (1.0 + np.exp(-xg_vals))
         else:
             meta_features[:, 1] = 0.5
 
-        # Only use rows where we have OOF predictions (not in first fold's training set)
+        # Context features
+        for i, col in enumerate(available_context):
+            meta_features[:, 3 + i] = features_df[col].fillna(0).values
+
+        # Only use rows where we have OOF predictions
         valid_mask = ~np.isnan(meta_features[:, 0])
         meta_X = meta_features[valid_mask]
         meta_y = y_win[valid_mask]
+        meta_sw = sample_weights[valid_mask] if sample_weights is not None else None
 
         if len(meta_y) < 50:
             logger.warning("Not enough data for meta-model (%d samples), skipping", len(meta_y))
             self.meta_model = None
             return
 
+        # Replace any remaining NaNs in context cols
+        meta_X = np.nan_to_num(meta_X, nan=0.0)
+
         self.meta_model = LogisticRegression(C=1.0, max_iter=1000)
-        self.meta_model.fit(meta_X, meta_y)
+        self.meta_model.fit(meta_X, meta_y, sample_weight=meta_sw)
 
         meta_probs = self.meta_model.predict_proba(meta_X)[:, 1]
         meta_acc = accuracy_score(meta_y, (meta_probs > 0.5).astype(int))
         meta_ll = log_loss(meta_y, meta_probs)
 
         coefs = self.meta_model.coef_[0]
-        logger.info("Meta-model weights: ML=%.3f, Poisson=%.3f, Elo=%.3f",
-                     coefs[0], coefs[1], coefs[2])
+        coef_str = ", ".join(f"{name}={c:.3f}" for name, c in zip(self.meta_feature_names, coefs))
+        logger.info("Meta-model weights: %s", coef_str)
         logger.info("Meta-model accuracy=%.3f, log_loss=%.3f", meta_acc, meta_ll)
 
     def blend_predictions(
@@ -312,13 +520,23 @@ class NHLPredictor:
         ml_prob: float,
         poisson_prob: float,
         elo_prob: float,
+        context: dict | None = None,
     ) -> float:
         """
-        Blend ML, Poisson, and Elo probabilities using the meta-model.
+        Blend ML, Poisson, and Elo probabilities using the enhanced meta-model.
         Falls back to 60/40 ML/Poisson if meta-model not available.
+
+        context: optional dict with keys like rest_diff, diff_momentum, etc.
         """
         if self.meta_model is not None:
-            X = np.array([[ml_prob, poisson_prob, elo_prob]])
+            base = [ml_prob, poisson_prob, elo_prob]
+            # Add context features in the same order as training
+            if context and len(self.meta_feature_names) > 3:
+                for col in self.meta_feature_names[3:]:
+                    base.append(context.get(col, 0.0))
+            elif len(self.meta_feature_names) > 3:
+                base.extend([0.0] * (len(self.meta_feature_names) - 3))
+            X = np.array([base])
             return float(self.meta_model.predict_proba(X)[0, 1])
         # Fallback: fixed weights
         return 0.60 * ml_prob + 0.40 * poisson_prob
@@ -481,8 +699,9 @@ class NHLPredictor:
         features_df: pd.DataFrame,
         results_df: pd.DataFrame,
         n_splits: int = 5,
+        sample_weighting: bool = True,
     ) -> dict:
-        """Time-series cross-validation."""
+        """Time-series cross-validation with sample weighting."""
         X, feature_names = _prepare_features(features_df)
 
         # Use selected features if available
@@ -496,6 +715,7 @@ class NHLPredictor:
         X_scaled_df = pd.DataFrame(X_scaled, columns=feature_names)
 
         y_win = results_df["home_win"].astype(int).values
+        all_weights = self._compute_sample_weights(len(y_win)) if sample_weighting else None
 
         tscv = TimeSeriesSplit(n_splits=n_splits)
 
@@ -509,8 +729,9 @@ class NHLPredictor:
             y_val = y_win[val_idx]
 
             model = self._build_classifier("cv")
-            model.fit(X_train, y_train,
-                       eval_set=[(X_val, y_val)], verbose=False)
+            sw = all_weights[train_idx] if all_weights is not None else None
+            fit_kw = self._fit_kwargs(model, X_val, y_val, sw)
+            model.fit(X_train, y_train, **fit_kw)
             proba = model.predict_proba(X_val)[:, 1]
             pred = (proba > 0.5).astype(int)
 
@@ -663,9 +884,15 @@ class NHLPredictor:
                 os.path.join(path, "shap_summary.csv"), index=False
             )
 
-        # Save meta-model
+        # Save meta-model and its feature names
         if self.meta_model is not None:
             joblib.dump(self.meta_model, os.path.join(path, "meta_model.pkl"))
+            with open(os.path.join(path, "meta_feature_names.json"), "w") as f:
+                json.dump(self.meta_feature_names, f)
+
+        # Save engine info
+        with open(os.path.join(path, "model_config.json"), "w") as f:
+            json.dump({"engine": self.engine}, f)
 
         logger.info("Model saved to %s", path)
 
@@ -692,15 +919,28 @@ class NHLPredictor:
         if os.path.exists(shap_path):
             self.shap_values_summary = pd.read_csv(shap_path)
 
-        # Load meta-model
+        # Load meta-model and its feature names
         meta_path = os.path.join(path, "meta_model.pkl")
         if os.path.exists(meta_path):
             self.meta_model = joblib.load(meta_path)
-            logger.info("Meta-model loaded (stacking enabled)")
+            meta_fn_path = os.path.join(path, "meta_feature_names.json")
+            if os.path.exists(meta_fn_path):
+                with open(meta_fn_path, "r") as f:
+                    self.meta_feature_names = json.load(f)
+            else:
+                self.meta_feature_names = ["ml_prob", "poisson_prob", "elo_prob"]
+            logger.info("Meta-model loaded (stacking enabled, %d features)", len(self.meta_feature_names))
+
+        # Load engine info
+        config_path = os.path.join(path, "model_config.json")
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                self.engine = json.load(f).get("engine", self.engine)
 
         self.is_trained = True
-        logger.info("Model loaded from %s (%d features%s)", path, len(self.feature_names),
-                     f", {len(self.selected_features)} selected" if self.selected_features else "")
+        logger.info("Model loaded from %s (%d features%s, engine=%s)", path, len(self.feature_names),
+                     f", {len(self.selected_features)} selected" if self.selected_features else "",
+                     self.engine)
 
     # ── Model builders ────────────────────────────────────────────────
 
@@ -710,13 +950,38 @@ class NHLPredictor:
         return HyperparamTuner.load_params()
 
     def _build_classifier(self, name: str):
-        """Build the best available classifier, using tuned params if available."""
+        """Build a classifier using the selected engine, with tuned params if available."""
         params = {}
         if self._tuned_params and "classifier" in self._tuned_params:
             params = self._tuned_params["classifier"]
             logger.debug("Using tuned classifier params for '%s'", name)
 
-        if xgb is not None:
+        if self.engine == "catboost" and cb is not None:
+            defaults = dict(
+                iterations=1000, depth=4, learning_rate=0.03,
+                subsample=0.7, rsm=0.7,  # rsm = colsample_bytree equivalent
+                l2_leaf_reg=2.0,
+                early_stopping_rounds=30,
+                random_seed=42,
+                verbose=0,
+                loss_function="Logloss",
+                eval_metric="Logloss",
+            )
+            # Map XGB-style params to CatBoost if tuned params came from XGB
+            if "max_depth" in params:
+                defaults["depth"] = params.pop("max_depth")
+            if "colsample_bytree" in params:
+                defaults["rsm"] = params.pop("colsample_bytree")
+            if "reg_lambda" in params:
+                defaults["l2_leaf_reg"] = params.pop("reg_lambda")
+            # Remove XGB-only params
+            for k in ("min_child_weight", "reg_alpha", "gamma",
+                       "n_estimators", "use_label_encoder", "eval_metric"):
+                params.pop(k, None)
+            defaults.update(params)
+            return cb.CatBoostClassifier(**defaults)
+
+        if self.engine == "xgboost" and xgb is not None:
             defaults = dict(
                 n_estimators=1000, max_depth=4, learning_rate=0.03,
                 subsample=0.7, colsample_bytree=0.7, min_child_weight=5,
@@ -731,7 +996,8 @@ class NHLPredictor:
                 random_state=42,
                 verbosity=0,
             )
-        elif lgb is not None:
+
+        if self.engine == "lightgbm" and lgb is not None:
             defaults = dict(
                 n_estimators=1000, max_depth=4, learning_rate=0.03,
                 subsample=0.7, colsample_bytree=0.7, min_child_weight=5,
@@ -742,22 +1008,65 @@ class NHLPredictor:
                 **defaults, random_state=42, verbose=-1,
                 callbacks=[lgb.early_stopping(30, verbose=False)],
             )
-        else:
-            from sklearn.ensemble import GradientBoostingClassifier
-            logger.warning("Neither XGBoost nor LightGBM available — using sklearn GBM")
-            return GradientBoostingClassifier(
-                n_estimators=200, max_depth=4, learning_rate=0.03,
-                subsample=0.7, random_state=42,
+
+        # Fallback: try any available engine
+        if xgb is not None:
+            return xgb.XGBClassifier(
+                n_estimators=1000, max_depth=4, learning_rate=0.03,
+                subsample=0.7, colsample_bytree=0.7, min_child_weight=5,
+                reg_alpha=0.3, reg_lambda=2.0, gamma=0.5,
+                early_stopping_rounds=30, use_label_encoder=False,
+                eval_metric="logloss", random_state=42, verbosity=0,
+            )
+        if cb is not None:
+            return cb.CatBoostClassifier(
+                iterations=1000, depth=4, learning_rate=0.03,
+                early_stopping_rounds=30, random_seed=42, verbose=0,
+            )
+        if lgb is not None:
+            return lgb.LGBMClassifier(
+                n_estimators=1000, max_depth=4, learning_rate=0.03,
+                random_state=42, verbose=-1,
+                callbacks=[lgb.early_stopping(30, verbose=False)],
             )
 
+        from sklearn.ensemble import GradientBoostingClassifier
+        logger.warning("No boosting library available — using sklearn GBM")
+        return GradientBoostingClassifier(
+            n_estimators=200, max_depth=4, learning_rate=0.03,
+            subsample=0.7, random_state=42,
+        )
+
     def _build_regressor(self, name: str):
-        """Build the best available regressor, using tuned params if available."""
+        """Build a regressor using the selected engine, with tuned params if available."""
         params = {}
         if self._tuned_params and "regressor" in self._tuned_params:
             params = self._tuned_params["regressor"]
             logger.debug("Using tuned regressor params for '%s'", name)
 
-        if xgb is not None:
+        if self.engine == "catboost" and cb is not None:
+            defaults = dict(
+                iterations=1000, depth=4, learning_rate=0.03,
+                subsample=0.7, rsm=0.7,
+                l2_leaf_reg=2.0,
+                early_stopping_rounds=20,
+                random_seed=42,
+                verbose=0,
+                loss_function="RMSE",
+            )
+            if "max_depth" in params:
+                defaults["depth"] = params.pop("max_depth")
+            if "colsample_bytree" in params:
+                defaults["rsm"] = params.pop("colsample_bytree")
+            if "reg_lambda" in params:
+                defaults["l2_leaf_reg"] = params.pop("reg_lambda")
+            for k in ("min_child_weight", "reg_alpha", "gamma",
+                       "n_estimators"):
+                params.pop(k, None)
+            defaults.update(params)
+            return cb.CatBoostRegressor(**defaults)
+
+        if self.engine == "xgboost" and xgb is not None:
             defaults = dict(
                 n_estimators=1000, max_depth=4, learning_rate=0.03,
                 subsample=0.7, colsample_bytree=0.7, min_child_weight=5,
@@ -768,7 +1077,8 @@ class NHLPredictor:
             return xgb.XGBRegressor(
                 **defaults, random_state=42, verbosity=0,
             )
-        elif lgb is not None:
+
+        if self.engine == "lightgbm" and lgb is not None:
             defaults = dict(
                 n_estimators=1000, max_depth=4, learning_rate=0.03,
                 subsample=0.7, colsample_bytree=0.7, min_child_weight=5,
@@ -779,12 +1089,30 @@ class NHLPredictor:
                 **defaults, random_state=42, verbose=-1,
                 callbacks=[lgb.early_stopping(20, verbose=False)],
             )
-        else:
-            from sklearn.ensemble import GradientBoostingRegressor
-            return GradientBoostingRegressor(
-                n_estimators=200, max_depth=4, learning_rate=0.03,
-                subsample=0.7, random_state=42,
+
+        # Fallback
+        if xgb is not None:
+            return xgb.XGBRegressor(
+                n_estimators=1000, max_depth=4, learning_rate=0.03,
+                early_stopping_rounds=20, random_state=42, verbosity=0,
             )
+        if cb is not None:
+            return cb.CatBoostRegressor(
+                iterations=1000, depth=4, learning_rate=0.03,
+                early_stopping_rounds=20, random_seed=42, verbose=0,
+            )
+        if lgb is not None:
+            return lgb.LGBMRegressor(
+                n_estimators=1000, max_depth=4, learning_rate=0.03,
+                random_state=42, verbose=-1,
+                callbacks=[lgb.early_stopping(20, verbose=False)],
+            )
+
+        from sklearn.ensemble import GradientBoostingRegressor
+        return GradientBoostingRegressor(
+            n_estimators=200, max_depth=4, learning_rate=0.03,
+            subsample=0.7, random_state=42,
+        )
 
     def _compute_feature_importance(self):
         """Extract feature importance from the win model."""

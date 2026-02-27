@@ -73,9 +73,9 @@ class NHLPredictionPipeline:
       5. Detect value bets
     """
 
-    def __init__(self):
+    def __init__(self, engine: str = "auto"):
         self.elo = EloSystem()
-        self.predictor = NHLPredictor()
+        self.predictor = NHLPredictor(engine=engine)
         self.engineer = FeatureEngineer(elo_system=self.elo)
         self.value_detector = ValueDetector(predictor=self.predictor)
         self.tracker = PredictionTracker()
@@ -261,6 +261,15 @@ class NHLPredictionPipeline:
             total_line = features.get("market_total", 5.5)
             poisson_pred = poisson.full_prediction(total_line=total_line)
 
+            # Pass context to enhanced meta-model blending
+            ml_pred["meta_context"] = {
+                "rest_diff": features.get("rest_diff", 0),
+                "diff_momentum": features.get("diff_momentum", 0),
+                "market_home_true_prob": features.get("market_home_true_prob", 0.5),
+                "diff_win_pct": features.get("diff_win_pct", 0),
+                "diff_goal_diff_pg": features.get("diff_goal_diff_pg", 0),
+            }
+
             # Value analysis
             market_data = {
                 "best_home_odds": features.get("best_home_odds", 0),
@@ -318,15 +327,24 @@ class NHLPredictionPipeline:
 
     # ── Training ─────────────────────────────────────────────────────
 
-    def train_model(self, seasons: list[str] = None):
+    def train_model(
+        self,
+        seasons: list[str] = None,
+        sample_weighting: bool = True,
+        auto_select_top_n: bool = True,
+    ):
         """
         Train the ML model on historical game data.
         Builds features for each past game and trains on outcomes.
+
+        seasons: list of season strings (e.g. ["20232024", "20242025"])
+                 Supports multi-season training for more data.
         """
         if seasons is None:
-            seasons = [cfg.previous_season]
+            seasons = cfg.training_seasons
 
-        logger.info("Training model on seasons: %s", seasons)
+        logger.info("Training model on seasons: %s (multi-season=%s)",
+                     seasons, len(seasons) > 1)
 
         all_features = []
         all_results = []
@@ -427,10 +445,15 @@ class NHLPredictionPipeline:
         features_df = pd.DataFrame(all_features)
         results_df = pd.DataFrame(all_results)
 
-        logger.info("Training on %d games with %d features", len(features_df), len(features_df.columns))
+        logger.info("Training on %d games with %d features (seasons: %s)",
+                     len(features_df), len(features_df.columns), ", ".join(seasons))
 
-        # Train
-        self.predictor.train(features_df, results_df)
+        # Train with new options
+        self.predictor.train(
+            features_df, results_df,
+            sample_weighting=sample_weighting,
+            auto_select_top_n=auto_select_top_n,
+        )
 
         # Evaluate
         metrics = self.predictor.evaluate(features_df, results_df)
@@ -623,7 +646,14 @@ def main():
     # train
     train_parser = subparsers.add_parser("train", help="Train model")
     train_parser.add_argument("--seasons", type=str, default=None,
-                              help="Comma-separated seasons (e.g. 20242025)")
+                              help="Comma-separated seasons (e.g. 20232024,20242025)")
+    train_parser.add_argument("--engine", type=str, default="auto",
+                              choices=["auto", "xgboost", "lightgbm", "catboost"],
+                              help="ML engine (default: auto)")
+    train_parser.add_argument("--no-weighting", action="store_true",
+                              help="Disable sample weighting by recency")
+    train_parser.add_argument("--no-auto-topn", action="store_true",
+                              help="Disable automatic top_n_features optimization")
 
     # evaluate
     subparsers.add_parser("evaluate", help="Evaluate model")
@@ -644,6 +674,9 @@ def main():
                              help="Number of Optuna trials (default: 100)")
     tune_parser.add_argument("--seasons", type=str, default=None,
                              help="Comma-separated seasons for tuning data")
+    tune_parser.add_argument("--engine", type=str, default="auto",
+                             choices=["auto", "xgboost", "lightgbm", "catboost"],
+                             help="ML engine for tuning (default: auto)")
 
     # calibrate
     cal_parser = subparsers.add_parser("calibrate", help="Calibration analysis on OOF predictions")
@@ -655,11 +688,19 @@ def main():
 
     args = parser.parse_args()
 
-    pipeline = NHLPredictionPipeline()
+    engine = getattr(args, "engine", "auto")
+    pipeline = NHLPredictionPipeline(engine=engine)
 
     if args.command == "train":
         seasons = args.seasons.split(",") if args.seasons else None
-        pipeline.train_model(seasons)
+        # Override engine if specified
+        if hasattr(args, "engine") and args.engine != "auto":
+            pipeline.predictor.engine = pipeline.predictor._resolve_engine(args.engine)
+        pipeline.train_model(
+            seasons,
+            sample_weighting=not getattr(args, "no_weighting", False),
+            auto_select_top_n=not getattr(args, "no_auto_topn", False),
+        )
 
     elif args.command == "predict":
         pipeline.load_data()
@@ -727,7 +768,8 @@ def main():
         from models.predictor import _prepare_features
 
         seasons = args.seasons.split(",") if args.seasons else None
-        logger.info("Preparing training data for hyperparameter tuning...")
+        tune_engine = getattr(args, "engine", "auto")
+        logger.info("Preparing training data for hyperparameter tuning (engine=%s)...", tune_engine)
 
         features_df, results_df = pipeline._prepare_training_data(seasons)
         if features_df is None:
@@ -742,13 +784,16 @@ def main():
         y_win = results_df["home_win"].astype(int).values
         y_total = results_df["total_goals"].values
 
-        tuner = HyperparamTuner()
+        tuner = HyperparamTuner(engine=tune_engine)
 
-        # Tune classifier
-        clf_params = tuner.tune_classifier(X_scaled, y_win, n_trials=args.trials)
+        # Tune classifier (with sample weighting)
+        clf_params = tuner.tune_classifier(X_scaled, y_win, n_trials=args.trials,
+                                           sample_weighting=True)
 
-        # Tune regressor
-        reg_params = tuner.tune_regressor(X_scaled, y_total, n_trials=max(args.trials // 2, 20))
+        # Tune regressor (with sample weighting)
+        reg_params = tuner.tune_regressor(X_scaled, y_total,
+                                          n_trials=max(args.trials // 2, 20),
+                                          sample_weighting=True)
 
         # Save params
         tuner.save_params(clf_params, reg_params)
