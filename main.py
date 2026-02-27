@@ -683,6 +683,16 @@ def main():
     cal_parser.add_argument("--seasons", type=str, default=None,
                             help="Comma-separated seasons for calibration data")
 
+    # sweetspot
+    ss_parser = subparsers.add_parser("sweetspot",
+        help="Find conditions where model accuracy reaches 75%+")
+    ss_parser.add_argument("--seasons", type=str, default=None,
+                           help="Comma-separated seasons for analysis")
+    ss_parser.add_argument("--target", type=float, default=0.75,
+                           help="Target accuracy (default: 0.75)")
+    ss_parser.add_argument("--min-sample", type=int, default=30,
+                           help="Minimum sample size per condition (default: 30)")
+
     # track
     subparsers.add_parser("track", help="Show prediction tracking report")
 
@@ -887,6 +897,141 @@ def main():
             print("  -> Value detector may find FALSE edges on favorites")
 
         print(f"\n{'='*65}\n")
+
+    elif args.command == "sweetspot":
+        from models.predictor import _prepare_features
+
+        seasons = args.seasons.split(",") if args.seasons else None
+        target = args.target
+        min_sample = args.min_sample
+
+        logger.info("Preparing data for sweet spot analysis (target=%.0f%%)...", target * 100)
+
+        features_df, results_df = pipeline._prepare_training_data(seasons)
+        if features_df is None:
+            logger.error("No training data available")
+            return
+
+        logger.info("Analyzing %d games for conditions with %.0f%%+ accuracy...",
+                     len(features_df), target * 100)
+
+        analysis = pipeline.predictor.sweetspot_analysis(
+            features_df, results_df,
+            target_accuracy=target,
+            min_sample=min_sample,
+        )
+
+        # ── Print report ─────────────────────────────────────────────
+        print(f"\n{'='*70}")
+        print(f"  SWEET SPOT ANALYSIS — When does the model hit {target:.0%}+ accuracy?")
+        print(f"{'='*70}")
+        print(f"\n  Overall OOF Accuracy: {analysis['overall_accuracy']:.1%}  ({analysis['total_games']} games)\n")
+
+        # 1. Confidence thresholds
+        print(f"  {'─'*65}")
+        print(f"  1. CONFIDENCE THRESHOLDS")
+        print(f"  {'─'*65}")
+        print(f"  {'Threshold':>12} {'Accuracy':>10} {'Games':>8} {'% Total':>10} {'Target?':>10}")
+        print(f"  {'─'*65}")
+        for cr in analysis["confidence_analysis"]:
+            marker = " <<<" if cr["above_target"] else ""
+            thr_label = f">= {cr['threshold']:.0%}"
+            target_hit = "YES" if cr["above_target"] else "no"
+            print(f"  {thr_label:>12} "
+                  f"{cr['accuracy']:>10.1%} {cr['n_games']:>8} "
+                  f"{cr['pct_of_total']:>9.1f}% "
+                  f"{target_hit:>10}{marker}")
+
+        # 2. Model agreement
+        if analysis["model_agreement"]:
+            print(f"\n  {'─'*65}")
+            print(f"  2. MODEL AGREEMENT (when models agree)")
+            print(f"  {'─'*65}")
+            for ma in analysis["model_agreement"]:
+                print(f"  {ma['condition']}:")
+                print(f"    Agree:    {ma['accuracy_agree']:.1%} accuracy  ({ma['n_agree']} games)")
+                print(f"    Disagree: {ma['accuracy_disagree']:.1%} accuracy  ({ma['n_disagree']} games)")
+
+        # 3. Feature filters
+        if analysis["feature_filters"]:
+            print(f"\n  {'─'*65}")
+            print(f"  3. SINGLE FEATURE FILTERS (sorted by accuracy)")
+            print(f"  {'─'*65}")
+            print(f"  {'Feature':<30} {'Condition':<18} {'Accuracy':>9} {'Games':>7} {'Impr':>7}")
+            print(f"  {'─'*65}")
+            shown = set()
+            for ff in analysis["feature_filters"][:15]:
+                key = ff["feature"]
+                if key in shown:
+                    continue
+                shown.add(key)
+                marker = " <<<" if ff["above_target"] else ""
+                print(f"  {ff['feature']:<30} {ff['condition']:<18} "
+                      f"{ff['accuracy']:>8.1%} {ff['n_games']:>7} "
+                      f"{ff['improvement']:>+6.1%}{marker}")
+
+        # 4. Combined rules
+        if analysis["combined_rules"]:
+            print(f"\n  {'─'*65}")
+            print(f"  4. COMBINED RULES (confidence + feature)")
+            print(f"  {'─'*65}")
+            for i, cr in enumerate(analysis["combined_rules"][:10], 1):
+                print(f"  #{i}: {cr['accuracy']:.1%} accuracy ({cr['n_games']} games, "
+                      f"{cr['pct_of_total']:.1f}% of total)")
+                print(f"      Rule: {cr['rule']}")
+
+        # 5. Decision tree rules
+        if analysis["tree_rules"]:
+            print(f"\n  {'─'*65}")
+            print(f"  5. AUTO-DISCOVERED RULES (decision tree)")
+            print(f"  {'─'*65}")
+            for i, tr in enumerate(analysis["tree_rules"][:8], 1):
+                print(f"  #{i}: {tr['accuracy']:.1%} accuracy ({tr['n_games']} games)")
+                print(f"      IF {tr['rule_text']}")
+
+        # Summary
+        print(f"\n  {'='*65}")
+        print(f"  SUMMARY")
+        print(f"  {'='*65}")
+
+        # Find best achievable accuracy with reasonable sample size
+        best_conf = max(analysis["confidence_analysis"],
+                        key=lambda x: x["accuracy"]) if analysis["confidence_analysis"] else None
+        best_combo = analysis["combined_rules"][0] if analysis["combined_rules"] else None
+
+        if best_conf:
+            print(f"  Best via confidence alone: {best_conf['accuracy']:.1%} "
+                  f"(threshold {best_conf['threshold']:.0%}, {best_conf['n_games']} games)")
+
+        if best_combo:
+            print(f"  Best combined rule:        {best_combo['accuracy']:.1%} "
+                  f"({best_combo['n_games']} games)")
+
+        # Can we reach the target?
+        target_reached = any(cr["above_target"] for cr in analysis["confidence_analysis"])
+        combo_reached = any(cr["accuracy"] >= target for cr in analysis.get("combined_rules", []))
+        tree_reached = any(tr["accuracy"] >= target for tr in analysis.get("tree_rules", []))
+
+        if target_reached or combo_reached or tree_reached:
+            print(f"\n  {target:.0%} accuracy IS achievable under specific conditions.")
+            if target_reached:
+                hits = [cr for cr in analysis["confidence_analysis"] if cr["above_target"]]
+                best_hit = max(hits, key=lambda x: x["n_games"])
+                print(f"  -> Best: confidence >= {best_hit['threshold']:.0%} → "
+                      f"{best_hit['accuracy']:.1%} on {best_hit['n_games']} games "
+                      f"({best_hit['pct_of_total']:.0f}% of all games)")
+        else:
+            # What's the best we can do?
+            all_accs = [cr["accuracy"] for cr in analysis["confidence_analysis"]]
+            if analysis["combined_rules"]:
+                all_accs += [cr["accuracy"] for cr in analysis["combined_rules"]]
+            best_possible = max(all_accs) if all_accs else analysis["overall_accuracy"]
+            print(f"\n  {target:.0%} accuracy NOT reliably achievable with current model.")
+            print(f"  Best achievable: {best_possible:.1%}")
+            gap = target - best_possible
+            print(f"  Gap to target: {gap:+.1%}")
+
+        print(f"\n{'='*70}\n")
 
     elif args.command == "evaluate":
         pipeline.load_data()

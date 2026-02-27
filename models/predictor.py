@@ -858,6 +858,320 @@ class NHLPredictor:
             "oof_brier": float(brier_score_loss(actuals, probs)),
         }
 
+    # ── Sweet Spot Analysis ────────────────────────────────────────────
+
+    def sweetspot_analysis(
+        self,
+        features_df: pd.DataFrame,
+        results_df: pd.DataFrame,
+        n_splits: int = 5,
+        min_sample: int = 30,
+        target_accuracy: float = 0.75,
+    ) -> dict:
+        """
+        Find conditions where the model achieves target_accuracy or better.
+
+        Uses OOF predictions + feature analysis to discover high-accuracy zones:
+          1. Confidence-based: which model confidence thresholds yield 75%+
+          2. Feature filters: which individual feature conditions improve accuracy
+          3. Combined rules: best combos of confidence + features
+          4. Decision tree rules: automated rule extraction
+
+        Returns structured dict with all findings.
+        """
+        X, feature_names = _prepare_features(features_df)
+
+        if self.selected_features:
+            use_features = [f for f in self.selected_features if f in X.columns]
+            if use_features:
+                X = X[use_features]
+                feature_names = use_features
+
+        y_win = results_df["home_win"].astype(int).values
+        sample_weights = self._compute_sample_weights(len(y_win))
+
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        oof_probs = np.full(len(y_win), np.nan)
+
+        for train_idx, val_idx in tscv.split(X):
+            X_train_raw = X.iloc[train_idx]
+            X_val_raw = X.iloc[val_idx]
+            y_train = y_win[train_idx]
+
+            scaler_tmp = StandardScaler()
+            X_tr = pd.DataFrame(
+                scaler_tmp.fit_transform(X_train_raw), columns=feature_names
+            )
+            X_vl = pd.DataFrame(
+                scaler_tmp.transform(X_val_raw), columns=feature_names
+            )
+
+            model = self._build_classifier("sweetspot_oof")
+            sw = sample_weights[train_idx]
+            fit_kw = self._fit_kwargs(model, X_vl, y_win[val_idx], sw)
+            model.fit(X_tr, y_train, **fit_kw)
+            oof_probs[val_idx] = model.predict_proba(X_vl)[:, 1]
+
+        valid = ~np.isnan(oof_probs)
+        probs = oof_probs[valid]
+        actuals = y_win[valid]
+        X_valid = X[valid].reset_index(drop=True)
+        features_valid = features_df[valid].reset_index(drop=True)
+
+        overall_acc = accuracy_score(actuals, (probs > 0.5).astype(int))
+        total_n = len(actuals)
+
+        # ── 1. Confidence Thresholds ──────────────────────────────────
+        thresholds = np.arange(0.50, 0.80, 0.02)
+        confidence_results = []
+        for t in thresholds:
+            # Model says home win with prob > t, or away win with prob > (1-t)
+            confident_mask = (probs >= t) | (probs <= (1 - t))
+            n = confident_mask.sum()
+            if n < min_sample:
+                continue
+            preds = np.where(probs > 0.5, 1, 0)
+            acc = accuracy_score(actuals[confident_mask], preds[confident_mask])
+            pct = n / total_n * 100
+            confidence_results.append({
+                "threshold": round(float(t), 2),
+                "accuracy": round(float(acc), 4),
+                "n_games": int(n),
+                "pct_of_total": round(float(pct), 1),
+                "above_target": acc >= target_accuracy,
+            })
+
+        # ── 2. Single Feature Filters ─────────────────────────────────
+        # Key features to analyze
+        analysis_features = {
+            "diff_win_pct": ("Win% diff (home - away)", "high"),
+            "diff_goal_diff_pg": ("Goal diff/game differential", "high"),
+            "diff_points_pct": ("Points% differential", "high"),
+            "elo_diff": ("Elo rating difference", "high"),
+            "diff_momentum": ("Momentum differential", "high"),
+            "diff_corsi_for_pct": ("Corsi% differential", "high"),
+            "diff_xg_diff_pg": ("xG differential", "high"),
+            "diff_goalie_save_pct": ("Goalie SV% differential", "high"),
+            "diff_special_teams_index": ("Special teams index diff", "high"),
+            "rest_diff": ("Rest days advantage", "high"),
+            "market_home_true_prob": ("Market implied home prob", "high"),
+            "h2h_win_pct": ("H2H win%", "high"),
+        }
+
+        feature_filters = []
+        preds = np.where(probs > 0.5, 1, 0)
+
+        for feat_name, (label, direction) in analysis_features.items():
+            if feat_name not in features_valid.columns:
+                continue
+
+            vals = features_valid[feat_name].values
+            if np.all(np.isnan(vals)) or np.std(vals[~np.isnan(vals)]) < 1e-8:
+                continue
+
+            # Try different percentile cutoffs
+            for pct in [60, 70, 75, 80, 90]:
+                cutoff = np.nanpercentile(np.abs(vals), pct)
+                if direction == "high":
+                    mask = vals >= cutoff
+                else:
+                    mask = vals <= -cutoff
+
+                n = mask.sum()
+                if n < min_sample:
+                    continue
+
+                acc = accuracy_score(actuals[mask], preds[mask])
+                if acc > overall_acc + 0.03:  # at least 3% improvement
+                    feature_filters.append({
+                        "feature": feat_name,
+                        "label": label,
+                        "condition": f">= {cutoff:.3f}" if direction == "high" else f"<= {-cutoff:.3f}",
+                        "percentile": pct,
+                        "accuracy": round(float(acc), 4),
+                        "n_games": int(n),
+                        "pct_of_total": round(float(n / total_n * 100), 1),
+                        "improvement": round(float(acc - overall_acc), 4),
+                        "above_target": acc >= target_accuracy,
+                    })
+
+        feature_filters.sort(key=lambda x: x["accuracy"], reverse=True)
+
+        # ── 3. Combined Rules (confidence + feature) ──────────────────
+        combined_rules = []
+
+        # Find best confidence threshold
+        best_conf = 0.55
+        for cr in confidence_results:
+            if cr["accuracy"] >= overall_acc + 0.02 and cr["n_games"] >= min_sample:
+                best_conf = cr["threshold"]
+                break
+
+        confident_mask = (probs >= best_conf) | (probs <= (1 - best_conf))
+
+        for feat_name, (label, direction) in analysis_features.items():
+            if feat_name not in features_valid.columns:
+                continue
+
+            vals = features_valid[feat_name].values
+            if np.all(np.isnan(vals)):
+                continue
+
+            for pct in [60, 70, 80]:
+                cutoff = np.nanpercentile(np.abs(vals), pct)
+                if direction == "high":
+                    feat_mask = vals >= cutoff
+                else:
+                    feat_mask = vals <= -cutoff
+
+                combo_mask = confident_mask & feat_mask
+                n = combo_mask.sum()
+                if n < max(min_sample // 2, 15):
+                    continue
+
+                acc = accuracy_score(actuals[combo_mask], preds[combo_mask])
+                if acc >= target_accuracy:
+                    combined_rules.append({
+                        "rule": f"confidence >= {best_conf:.0%} AND {feat_name} {'>=' if direction == 'high' else '<='} {cutoff:.3f} (p{pct})",
+                        "feature": feat_name,
+                        "confidence_threshold": best_conf,
+                        "feature_percentile": pct,
+                        "accuracy": round(float(acc), 4),
+                        "n_games": int(n),
+                        "pct_of_total": round(float(n / total_n * 100), 1),
+                    })
+
+        combined_rules.sort(key=lambda x: (-x["accuracy"], -x["n_games"]))
+
+        # ── 4. Decision Tree Rule Extraction ──────────────────────────
+        tree_rules = self._extract_tree_rules(
+            X_valid, actuals, preds, probs, feature_names,
+            min_sample, target_accuracy
+        )
+
+        # ── 5. Model Agreement Analysis ───────────────────────────────
+        agreement_results = []
+        if "elo_home_win_prob" in features_valid.columns:
+            elo_probs = features_valid["elo_home_win_prob"].fillna(0.5).values
+            elo_preds = (elo_probs > 0.5).astype(int)
+            ml_preds = (probs > 0.5).astype(int)
+            agree_mask = elo_preds == ml_preds
+
+            n_agree = agree_mask.sum()
+            if n_agree >= min_sample:
+                acc_agree = accuracy_score(actuals[agree_mask], ml_preds[agree_mask])
+                acc_disagree = accuracy_score(actuals[~agree_mask], ml_preds[~agree_mask])
+                agreement_results.append({
+                    "condition": "ML and Elo agree on winner",
+                    "accuracy_agree": round(float(acc_agree), 4),
+                    "n_agree": int(n_agree),
+                    "accuracy_disagree": round(float(acc_disagree), 4),
+                    "n_disagree": int((~agree_mask).sum()),
+                })
+
+        if "market_home_true_prob" in features_valid.columns:
+            mkt_probs = features_valid["market_home_true_prob"].fillna(0.5).values
+            mkt_preds = (mkt_probs > 0.5).astype(int)
+            ml_preds = (probs > 0.5).astype(int)
+            agree_mask = mkt_preds == ml_preds
+
+            n_agree = agree_mask.sum()
+            if n_agree >= min_sample:
+                acc_agree = accuracy_score(actuals[agree_mask], ml_preds[agree_mask])
+                acc_disagree = accuracy_score(actuals[~agree_mask], ml_preds[~agree_mask])
+                agreement_results.append({
+                    "condition": "ML and Market agree on winner",
+                    "accuracy_agree": round(float(acc_agree), 4),
+                    "n_agree": int(n_agree),
+                    "accuracy_disagree": round(float(acc_disagree), 4),
+                    "n_disagree": int((~agree_mask).sum()),
+                })
+
+        return {
+            "overall_accuracy": round(float(overall_acc), 4),
+            "total_games": total_n,
+            "target_accuracy": target_accuracy,
+            "confidence_analysis": confidence_results,
+            "feature_filters": feature_filters[:20],  # top 20
+            "combined_rules": combined_rules[:15],  # top 15
+            "tree_rules": tree_rules,
+            "model_agreement": agreement_results,
+        }
+
+    @staticmethod
+    def _extract_tree_rules(
+        X: pd.DataFrame,
+        actuals: np.ndarray,
+        preds: np.ndarray,
+        probs: np.ndarray,
+        feature_names: list[str],
+        min_sample: int,
+        target_accuracy: float,
+    ) -> list[dict]:
+        """Use a shallow decision tree to extract interpretable rules."""
+        from sklearn.tree import DecisionTreeClassifier
+
+        # Target: was the ML model's prediction correct?
+        correct = (preds == actuals).astype(int)
+
+        # Add model confidence as a feature
+        confidence = np.abs(probs - 0.5) * 2  # 0 = coin flip, 1 = certain
+        X_tree = X.copy()
+        X_tree["_model_confidence"] = confidence
+        tree_features = list(feature_names) + ["_model_confidence"]
+
+        # Replace NaN/inf
+        X_tree = X_tree.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+        tree = DecisionTreeClassifier(
+            max_depth=3,
+            min_samples_leaf=max(min_sample, 20),
+            random_state=42,
+        )
+        tree.fit(X_tree[tree_features], correct)
+
+        # Extract leaf info
+        rules = []
+        tree_obj = tree.tree_
+        n_nodes = tree_obj.node_count
+
+        def _traverse(node_id, path_conditions):
+            if tree_obj.children_left[node_id] == tree_obj.children_right[node_id]:
+                # Leaf node
+                total = tree_obj.n_node_samples[node_id]
+                correct_count = int(tree_obj.value[node_id][0][1])
+                accuracy = correct_count / total if total > 0 else 0
+
+                if accuracy >= target_accuracy and total >= min_sample // 2:
+                    rules.append({
+                        "conditions": list(path_conditions),
+                        "rule_text": " AND ".join(path_conditions),
+                        "accuracy": round(float(accuracy), 4),
+                        "n_games": int(total),
+                        "correct": correct_count,
+                    })
+                return
+
+            feat_idx = tree_obj.feature[node_id]
+            feat_name = tree_features[feat_idx]
+            threshold = tree_obj.threshold[node_id]
+
+            # Left child: feature <= threshold
+            _traverse(
+                tree_obj.children_left[node_id],
+                path_conditions + [f"{feat_name} <= {threshold:.3f}"]
+            )
+            # Right child: feature > threshold
+            _traverse(
+                tree_obj.children_right[node_id],
+                path_conditions + [f"{feat_name} > {threshold:.3f}"]
+            )
+
+        _traverse(0, [])
+
+        rules.sort(key=lambda x: (-x["accuracy"], -x["n_games"]))
+        return rules[:10]
+
     # ── Save / Load ───────────────────────────────────────────────────
 
     def save(self, path: Optional[str] = None):
