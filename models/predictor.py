@@ -335,7 +335,11 @@ class NHLPredictor:
         try:
             # Train a quick model for SHAP analysis
             model = self._build_classifier("shap_select")
-            model.fit(X, y)
+            split_idx = int(len(X) * 0.85)
+            X_train, X_eval = X.iloc[:split_idx], X.iloc[split_idx:]
+            y_train, y_eval = y[:split_idx], y[split_idx:]
+            model.fit(X_train, y_train,
+                      eval_set=[(X_eval, y_eval)], verbose=False)
 
             explainer = shap.TreeExplainer(model)
             shap_vals = explainer.shap_values(X)
