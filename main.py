@@ -687,7 +687,7 @@ def main():
 
     # sweetspot
     ss_parser = subparsers.add_parser("sweetspot",
-        help="Find conditions where model accuracy reaches 75%+")
+        help="Find conditions where model accuracy reaches 75%%+")
     ss_parser.add_argument("--seasons", type=str, default=None,
                            help="Comma-separated seasons for analysis")
     ss_parser.add_argument("--target", type=float, default=0.75,
