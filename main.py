@@ -642,6 +642,8 @@ def main():
     # predict
     pred_parser = subparsers.add_parser("predict", help="Predict games")
     pred_parser.add_argument("--date", type=str, default=None, help="Date YYYY-MM-DD")
+    pred_parser.add_argument("--min-confidence", type=float, default=None,
+                             help="Only show picks with confidence >= this %% (e.g. 60)")
 
     # train
     train_parser = subparsers.add_parser("train", help="Train model")
@@ -723,6 +725,17 @@ def main():
             logger.info("No pre-trained model found — predictions will use Elo + Poisson only")
 
         predictions = pipeline.predict_games(args.date)
+
+        # Filter by minimum confidence if specified
+        min_conf = args.min_confidence
+        if min_conf is not None:
+            threshold = min_conf / 100.0 if min_conf > 1 else min_conf
+            filtered = [p for p in predictions
+                        if max(p["home_win_prob"], p["away_win_prob"]) >= threshold]
+            logger.info("Confidence filter >= %.0f%%: %d/%d games pass",
+                        threshold * 100, len(filtered), len(predictions))
+            predictions = filtered
+
         pipeline.print_predictions(predictions)
 
         # Log predictions for tracking
