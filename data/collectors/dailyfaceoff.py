@@ -112,45 +112,39 @@ def get_injuries() -> pd.DataFrame:
     Scrape current injury report.
     Returns: team, player_name, injury, status, estimated_return.
     """
-    if BeautifulSoup is None:
-        return pd.DataFrame()
+    import json
 
-    # Try multiple URL patterns since DailyFaceoff changes structure
-    urls = [
-        f"{DFO_BASE}/injuries",
-        f"{DFO_BASE}/teams/injury-report/",
-        f"{DFO_BASE}/injury-report/",
-    ]
-    resp = None
-    for url in urls:
-        resp = safe_request(url, headers=HEADERS, retries=1)
-        if resp is not None:
-            break
+    resp = safe_request(f"{DFO_BASE}/hockey-player-news/injuries", headers=HEADERS)
     if resp is None:
         logger.warning("Could not reach DailyFaceoff injury report")
         return pd.DataFrame()
-    if resp is None:
-        return pd.DataFrame()
 
-    soup = BeautifulSoup(resp.text, "lxml")
     rows = []
 
-    # Parse injury tables
-    tables = soup.find_all("table")
-    for table in tables:
-        # Try to get team name from header above table
-        header = table.find_previous(["h2", "h3", "h4"])
-        team_name = header.get_text(strip=True) if header else "Unknown"
+    # Page embeds JSON in __NEXT_DATA__ script tag
+    soup = BeautifulSoup(resp.text, "html.parser") if BeautifulSoup else None
+    if soup is None:
+        return pd.DataFrame()
 
-        for tr in table.find_all("tr")[1:]:  # skip header
-            cells = tr.find_all("td")
-            if len(cells) >= 3:
+    script = soup.find("script", id="__NEXT_DATA__")
+    if script and script.string:
+        try:
+            data = json.loads(script.string)
+            page_data = data["props"]["pageProps"]["data"]
+            news_items = page_data.get("data", [])
+
+            for item in news_items:
                 rows.append({
-                    "team": team_name,
-                    "player_name": cells[0].get_text(strip=True),
-                    "injury": cells[1].get_text(strip=True) if len(cells) > 1 else "",
-                    "status": cells[2].get_text(strip=True) if len(cells) > 2 else "",
-                    "estimated_return": cells[3].get_text(strip=True) if len(cells) > 3 else "",
+                    "team": item.get("teamName", ""),
+                    "player_name": item.get("playerName", ""),
+                    "injury": item.get("details", ""),
+                    "status": item.get("newsCategoryName", ""),
+                    "estimated_return": item.get("date", ""),
                 })
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f"Failed to parse __NEXT_DATA__ JSON: {e}")
+
+    if not rows:
+        logger.warning("No injury data found on DailyFaceoff page")
 
     return pd.DataFrame(rows)
