@@ -12,6 +12,7 @@ Usage:
   python main.py tune [--trials 100]            Tune hyperparameters with Optuna
   python main.py calibrate [--seasons ...]       Calibration analysis on OOF predictions
   python main.py track                          Show prediction tracking report
+  python main.py pipeline [--trials 150]        Full pipeline: tune → train → calibrate → sweetspot
 """
 
 import sys
@@ -698,6 +699,25 @@ def main():
     # track
     subparsers.add_parser("track", help="Show prediction tracking report")
 
+    # pipeline — full training pipeline: tune → train → calibrate → sweetspot
+    pipe_parser = subparsers.add_parser("pipeline",
+        help="Run full pipeline: tune → train → calibrate → sweetspot")
+    pipe_parser.add_argument("--trials", type=int, default=150,
+                             help="Number of Optuna trials (default: 150)")
+    pipe_parser.add_argument("--seasons", type=str, default=None,
+                             help="Comma-separated seasons (e.g. 20232024,20242025)")
+    pipe_parser.add_argument("--engine", type=str, default="auto",
+                             choices=["auto", "xgboost", "lightgbm", "catboost"],
+                             help="ML engine (default: auto)")
+    pipe_parser.add_argument("--skip-tune", action="store_true",
+                             help="Skip tuning (use existing best_params.json)")
+    pipe_parser.add_argument("--skip-calibrate", action="store_true",
+                             help="Skip calibration and sweetspot analysis")
+    pipe_parser.add_argument("--no-weighting", action="store_true",
+                             help="Disable sample weighting by recency")
+    pipe_parser.add_argument("--no-auto-topn", action="store_true",
+                             help="Disable automatic top_n_features optimization")
+
     args = parser.parse_args()
 
     engine = getattr(args, "engine", "auto")
@@ -1054,6 +1074,137 @@ def main():
             logger.error("No trained model to evaluate. Run 'train' first.")
             return
         logger.info("Run training with --seasons to get evaluation metrics.")
+
+    elif args.command == "pipeline":
+        import time
+        from models.tuner import HyperparamTuner
+        from models.predictor import _prepare_features
+
+        seasons = args.seasons.split(",") if args.seasons else None
+        pipe_engine = getattr(args, "engine", "auto")
+        total_start = time.time()
+
+        stages = []
+        if not args.skip_tune:
+            stages.append("tune")
+        stages.append("train")
+        if not args.skip_calibrate:
+            stages += ["calibrate", "sweetspot"]
+
+        print(f"\n{'='*65}")
+        print(f"  FULL PIPELINE: {' → '.join(stages)}")
+        print(f"{'='*65}\n")
+
+        # ── Stage 1: Tune ──────────────────────────────────────────
+        if not args.skip_tune:
+            stage_start = time.time()
+            print(f"  [1/{len(stages)}] TUNING HYPERPARAMETERS ({args.trials} trials)...")
+            print(f"  {'─'*60}")
+
+            features_df, results_df = pipeline._prepare_training_data(seasons)
+            if features_df is None:
+                logger.error("No training data available — aborting pipeline")
+                return
+
+            X, feature_names = _prepare_features(features_df)
+            from sklearn.preprocessing import StandardScaler
+            scaler = StandardScaler()
+            X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=feature_names)
+
+            y_win = results_df["home_win"].astype(int).values
+            y_total = results_df["total_goals"].values
+
+            tuner = HyperparamTuner(engine=pipe_engine)
+            clf_params = tuner.tune_classifier(X_scaled, y_win, n_trials=args.trials,
+                                               sample_weighting=True)
+            reg_params = tuner.tune_regressor(X_scaled, y_total,
+                                              n_trials=max(args.trials // 2, 20),
+                                              sample_weighting=True)
+            tuner.save_params(clf_params, reg_params)
+
+            elapsed = time.time() - stage_start
+            print(f"  Tune completed in {elapsed:.0f}s")
+            print(f"  Best classifier log_loss params saved")
+            print(f"  Best regressor MAE params saved\n")
+        else:
+            print(f"  [skip] Tuning skipped — using existing best_params.json\n")
+
+        # ── Stage 2: Train ─────────────────────────────────────────
+        stage_idx = 2 if not args.skip_tune else 1
+        stage_start = time.time()
+        print(f"  [{stage_idx}/{len(stages)}] TRAINING MODEL...")
+        print(f"  {'─'*60}")
+
+        if hasattr(args, "engine") and args.engine != "auto":
+            pipeline.predictor.engine = pipeline.predictor._resolve_engine(args.engine)
+
+        pipeline.train_model(
+            seasons,
+            sample_weighting=not getattr(args, "no_weighting", False),
+            auto_select_top_n=not getattr(args, "no_auto_topn", False),
+        )
+
+        elapsed = time.time() - stage_start
+        print(f"  Train completed in {elapsed:.0f}s\n")
+
+        # ── Stage 3: Calibrate ─────────────────────────────────────
+        if not args.skip_calibrate:
+            stage_idx += 1
+            stage_start = time.time()
+            print(f"  [{stage_idx}/{len(stages)}] CALIBRATION ANALYSIS...")
+            print(f"  {'─'*60}")
+
+            features_df, results_df = pipeline._prepare_training_data(seasons)
+            if features_df is not None:
+                cal = pipeline.predictor.calibration_analysis(features_df, results_df)
+                print(f"  OOF Accuracy:  {cal['oof_accuracy']:.1%}")
+                print(f"  OOF Log Loss:  {cal['oof_log_loss']:.4f}")
+                print(f"  OOF Brier:     {cal['oof_brier']:.4f}")
+                print(f"  ECE:           {cal['ece']:.4f}")
+                if cal['overconfidence'] > 0.02:
+                    print(f"  WARNING: Overconfident by {cal['overconfidence']:.1%}")
+            else:
+                logger.warning("Could not run calibration — no data")
+
+            elapsed = time.time() - stage_start
+            print(f"  Calibrate completed in {elapsed:.0f}s\n")
+
+            # ── Stage 4: Sweetspot ─────────────────────────────────
+            stage_idx += 1
+            stage_start = time.time()
+            print(f"  [{stage_idx}/{len(stages)}] SWEETSPOT ANALYSIS...")
+            print(f"  {'─'*60}")
+
+            if features_df is not None:
+                analysis = pipeline.predictor.sweetspot_analysis(
+                    features_df, results_df, target_accuracy=0.75, min_sample=30)
+                print(f"  Overall OOF Accuracy: {analysis['overall_accuracy']:.1%} "
+                      f"({analysis['total_games']} games)")
+
+                best_conf = max(analysis["confidence_analysis"],
+                                key=lambda x: x["accuracy"]) if analysis["confidence_analysis"] else None
+                if best_conf:
+                    print(f"  Best via confidence: {best_conf['accuracy']:.1%} "
+                          f"(>= {best_conf['threshold']:.0%}, {best_conf['n_games']} games)")
+
+                best_combo = analysis["combined_rules"][0] if analysis["combined_rules"] else None
+                if best_combo:
+                    print(f"  Best combined rule:  {best_combo['accuracy']:.1%} "
+                          f"({best_combo['n_games']} games)")
+            else:
+                logger.warning("Could not run sweetspot — no data")
+
+            elapsed = time.time() - stage_start
+            print(f"  Sweetspot completed in {elapsed:.0f}s\n")
+
+        # ── Summary ────────────────────────────────────────────────
+        total_elapsed = time.time() - total_start
+        minutes = int(total_elapsed // 60)
+        seconds = int(total_elapsed % 60)
+        print(f"{'='*65}")
+        print(f"  PIPELINE COMPLETE — {minutes}m {seconds}s total")
+        print(f"  Stages: {' → '.join(stages)}")
+        print(f"{'='*65}\n")
 
     else:
         parser.print_help()
