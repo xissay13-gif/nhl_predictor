@@ -471,7 +471,7 @@ class NHLPredictionPipeline:
     def _prepare_training_data(self, seasons: list[str] = None):
         """Prepare training data and return (features_df, results_df). Used by tune."""
         if seasons is None:
-            seasons = [cfg.previous_season]
+            seasons = cfg.training_seasons
 
         all_features = []
         all_results = []
