@@ -51,8 +51,9 @@ class Config:
     roster_continuity_weight: float = 0.8
 
     # ── Value betting thresholds ──────────────────────────────────────
-    min_edge_pct: float = 3.0        # minimum edge % to flag a value bet
-    kelly_fraction: float = 0.25     # quarter-Kelly for bankroll sizing
+    min_edge_pct: float = 6.0        # minimum edge % to flag a value bet (Variant B)
+    kelly_fraction: float = 0.40     # aggressive Kelly for 10-15% monthly growth
+    max_bet_pct: float = 0.05        # max 5% of bankroll per single bet
 
     # ── Team abbreviations mapping ────────────────────────────────────
     team_abbrevs: dict = field(default_factory=lambda: {

@@ -28,15 +28,32 @@ class ValueDetector:
     Detect value bets by comparing model probabilities vs market odds.
     """
 
+    # Tiered Kelly: higher confidence → more aggressive sizing
+    TIERED_KELLY = {
+        "HIGH": 1.0,       # full kelly_frac for edge ≥ 10%
+        "MEDIUM": 0.75,    # 75% of kelly_frac for edge 6-10%
+        "LOW": 0.50,       # 50% of kelly_frac for edge 3-6%
+        "NONE": 0.0,
+    }
+
     def __init__(
         self,
         min_edge_pct: float = cfg.min_edge_pct,
         kelly_frac: float = cfg.kelly_fraction,
+        max_bet_pct: float = cfg.max_bet_pct,
         predictor=None,
     ):
         self.min_edge = min_edge_pct / 100.0
         self.kelly_frac = kelly_frac
+        self.max_bet_pct = max_bet_pct
         self.predictor = predictor  # NHLPredictor instance for meta-model blending
+
+    def _sized_kelly(self, prob: float, dec_odds: float, confidence: str) -> float:
+        """Kelly sizing with tiered multiplier and max bet cap."""
+        tier_mult = self.TIERED_KELLY.get(confidence, 0.5)
+        frac = self.kelly_frac * tier_mult
+        raw = kelly_criterion(prob, dec_odds, frac)
+        return min(raw, self.max_bet_pct)
 
     def analyze_moneyline(
         self,
@@ -58,7 +75,8 @@ class ValueDetector:
         home_edge = model_home_prob - home_implied
         if home_edge >= self.min_edge:
             dec = american_to_decimal(best_home_odds)
-            kelly = kelly_criterion(model_home_prob, dec, self.kelly_frac)
+            conf = _confidence_level(home_edge)
+            kelly = self._sized_kelly(model_home_prob, dec, conf)
             values.append({
                 "market": "moneyline",
                 "side": "home",
@@ -71,7 +89,7 @@ class ValueDetector:
                 "decimal_odds": round(dec, 3),
                 "kelly_size": round(kelly, 4),
                 "expected_value": round((model_home_prob * dec - 1) * 100, 2),
-                "confidence": _confidence_level(home_edge),
+                "confidence": conf,
             })
 
         # Away ML
@@ -79,7 +97,8 @@ class ValueDetector:
         away_edge = model_away_prob - away_implied
         if away_edge >= self.min_edge:
             dec = american_to_decimal(best_away_odds)
-            kelly = kelly_criterion(model_away_prob, dec, self.kelly_frac)
+            conf = _confidence_level(away_edge)
+            kelly = self._sized_kelly(model_away_prob, dec, conf)
             values.append({
                 "market": "moneyline",
                 "side": "away",
@@ -92,7 +111,7 @@ class ValueDetector:
                 "decimal_odds": round(dec, 3),
                 "kelly_size": round(kelly, 4),
                 "expected_value": round((model_away_prob * dec - 1) * 100, 2),
-                "confidence": _confidence_level(away_edge),
+                "confidence": conf,
             })
 
         return values
@@ -111,7 +130,8 @@ class ValueDetector:
 
         if edge >= self.min_edge:
             dec = american_to_decimal(spread_odds)
-            kelly = kelly_criterion(model_cover_prob, dec, self.kelly_frac)
+            conf = _confidence_level(edge)
+            kelly = self._sized_kelly(model_cover_prob, dec, conf)
             return {
                 "market": "spread",
                 "side": side,
@@ -125,7 +145,7 @@ class ValueDetector:
                 "decimal_odds": round(dec, 3),
                 "kelly_size": round(kelly, 4),
                 "expected_value": round((model_cover_prob * dec - 1) * 100, 2),
-                "confidence": _confidence_level(edge),
+                "confidence": conf,
             }
         return None
 
@@ -145,7 +165,8 @@ class ValueDetector:
         over_edge = model_over_prob - over_implied
         if over_edge >= self.min_edge:
             dec = american_to_decimal(over_odds)
-            kelly = kelly_criterion(model_over_prob, dec, self.kelly_frac)
+            conf = _confidence_level(over_edge)
+            kelly = self._sized_kelly(model_over_prob, dec, conf)
             values.append({
                 "market": "total",
                 "side": "over",
@@ -158,7 +179,7 @@ class ValueDetector:
                 "decimal_odds": round(dec, 3),
                 "kelly_size": round(kelly, 4),
                 "expected_value": round((model_over_prob * dec - 1) * 100, 2),
-                "confidence": _confidence_level(over_edge),
+                "confidence": conf,
             })
 
         # Under
@@ -166,7 +187,8 @@ class ValueDetector:
         under_edge = model_under_prob - under_implied
         if under_edge >= self.min_edge:
             dec = american_to_decimal(under_odds)
-            kelly = kelly_criterion(model_under_prob, dec, self.kelly_frac)
+            conf = _confidence_level(under_edge)
+            kelly = self._sized_kelly(model_under_prob, dec, conf)
             values.append({
                 "market": "total",
                 "side": "under",
@@ -179,7 +201,7 @@ class ValueDetector:
                 "decimal_odds": round(dec, 3),
                 "kelly_size": round(kelly, 4),
                 "expected_value": round((model_under_prob * dec - 1) * 100, 2),
-                "confidence": _confidence_level(under_edge),
+                "confidence": conf,
             })
 
         return values
@@ -226,7 +248,7 @@ class ValueDetector:
         poisson_cover = poisson_predictions.get("cover_prob", 0.40)
         blended_cover = 0.55 * ml_cover + 0.45 * poisson_cover
 
-        # ── Collect all value opportunities (moneyline only) ─────────
+        # ── Collect all value opportunities ────────────────────────────
         all_values = []
 
         # Moneyline
@@ -236,6 +258,37 @@ class ValueDetector:
             all_values.extend(self.analyze_moneyline(
                 blended_home, blended_away, best_home, best_away,
                 home_team, away_team,
+            ))
+
+        # Spread / puck line
+        spread_line = market_data.get("spread_line", -1.5)
+        home_spread_odds = market_data.get("home_spread_odds", 0)
+        away_spread_odds = market_data.get("away_spread_odds", 0)
+        if home_spread_odds:
+            val = self.analyze_spread(
+                blended_cover, spread_line, home_spread_odds,
+                side="home", team=home_team,
+            )
+            if val:
+                all_values.append(val)
+        if away_spread_odds:
+            away_cover = 1.0 - blended_cover
+            val = self.analyze_spread(
+                away_cover, -spread_line, away_spread_odds,
+                side="away", team=away_team,
+            )
+            if val:
+                all_values.append(val)
+
+        # Totals (over/under)
+        total_line = market_data.get("total_line", 0)
+        over_odds = market_data.get("over_odds", 0)
+        under_odds = market_data.get("under_odds", 0)
+        if total_line and over_odds and under_odds:
+            over_prob = poisson_predictions.get("over_prob", 0.5)
+            under_prob = poisson_predictions.get("under_prob", 0.5)
+            all_values.extend(self.analyze_total(
+                over_prob, under_prob, total_line, over_odds, under_odds,
             ))
 
         # Sort by edge descending
