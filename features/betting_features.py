@@ -99,17 +99,38 @@ def compute_totals_features(
 ) -> dict:
     """Extract over/under consensus features."""
     if totals_df.empty:
-        return {"market_total": 5.5, "market_over_implied": 0.5, "market_under_implied": 0.5}
+        return {"market_total": 5.5, "market_over_implied": 0.5, "market_under_implied": 0.5,
+                "best_over_odds": 0, "best_under_odds": 0}
 
     row = _find_matchup_totals(totals_df, home_team, away_team)
     if row is None:
-        return {"market_total": 5.5, "market_over_implied": 0.5, "market_under_implied": 0.5}
+        return {"market_total": 5.5, "market_over_implied": 0.5, "market_under_implied": 0.5,
+                "best_over_odds": 0, "best_under_odds": 0}
 
     return {
         "market_total": row.get("total", 5.5),
         "market_over_implied": row.get("over_implied", 0.5),
         "market_under_implied": row.get("under_implied", 0.5),
+        "best_over_odds": row.get("best_over_odds", 0),
+        "best_under_odds": row.get("best_under_odds", 0),
     }
+
+
+def compute_spread_features(
+    spreads_df: pd.DataFrame,
+    home_team: str,
+    away_team: str,
+) -> dict:
+    """Extract puck line (spread) odds for a specific matchup."""
+    default = {"spread_line": -1.5, "best_home_spread_odds": 0, "best_away_spread_odds": 0}
+    if spreads_df is None or spreads_df.empty:
+        return default
+
+    row = _find_matchup_spreads(spreads_df, home_team, away_team)
+    if row is None:
+        return default
+
+    return row
 
 
 def _find_matchup(df: pd.DataFrame, home: str, away: str):
@@ -137,6 +158,27 @@ def _find_matchup_totals(df: pd.DataFrame, home: str, away: str):
                 "total": over.iloc[0]["total"] if not over.empty else 5.5,
                 "over_implied": over["implied"].mean() if not over.empty else 0.5,
                 "under_implied": under["implied"].mean() if not under.empty else 0.5,
+                "best_over_odds": int(over["odds"].max()) if not over.empty else 0,
+                "best_under_odds": int(under["odds"].max()) if not under.empty else 0,
+            }
+    return None
+
+
+def _find_matchup_spreads(df: pd.DataFrame, home: str, away: str):
+    """Find spread (puck line) data for a matchup."""
+    for game_id in df["game_id"].unique():
+        game = df[df["game_id"] == game_id]
+        h = str(game.iloc[0].get("home_team", "")).lower()
+        a = str(game.iloc[0].get("away_team", "")).lower()
+        if (home.lower() in h or h in home.lower()) and \
+           (away.lower() in a or a in away.lower()):
+            home_side = game[game["side"] == "home"]
+            away_side = game[game["side"] == "away"]
+            spread_val = home_side.iloc[0]["spread"] if not home_side.empty else -1.5
+            return {
+                "spread_line": spread_val,
+                "best_home_spread_odds": int(home_side["odds"].max()) if not home_side.empty else 0,
+                "best_away_spread_odds": int(away_side["odds"].max()) if not away_side.empty else 0,
             }
     return None
 

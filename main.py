@@ -38,7 +38,7 @@ from data.collectors.moneypuck import (
     get_goalie_5v5, get_team_all_situations,
 )
 from data.collectors.odds_api import (
-    get_consensus_odds, get_totals, get_moneyline,
+    get_consensus_odds, get_totals, get_moneyline, get_spreads,
 )
 from data.collectors.dailyfaceoff import get_starting_goalies, get_injuries
 
@@ -49,6 +49,7 @@ from models.predictor import NHLPredictor
 
 # Features
 from features.engineer import FeatureEngineer
+from features.betting_features import compute_spread_features, compute_totals_features
 
 # Value
 from value.detector import ValueDetector, format_value_report
@@ -226,6 +227,7 @@ class NHLPredictionPipeline:
         # Get odds (filtered to target date only)
         consensus = get_consensus_odds(target_date=target_date)
         totals_df = get_totals(target_date=target_date)
+        spreads_df = get_spreads(target_date=target_date)
 
         results = []
 
@@ -271,12 +273,21 @@ class NHLPredictionPipeline:
                 "diff_goal_diff_pg": features.get("diff_goal_diff_pg", 0),
             }
 
+            # Per-game spread and totals odds
+            spread_info = compute_spread_features(spreads_df, home, away)
+            totals_info = compute_totals_features(totals_df, home, away)
+
             # Value analysis
             market_data = {
                 "best_home_odds": features.get("best_home_odds", 0),
                 "best_away_odds": features.get("best_away_odds", 0),
                 "market_total": total_line,
-                "spread_odds": -110,
+                "spread_line": spread_info["spread_line"],
+                "home_spread_odds": spread_info["best_home_spread_odds"],
+                "away_spread_odds": spread_info["best_away_spread_odds"],
+                "over_odds": totals_info.get("best_over_odds", 0),
+                "under_odds": totals_info.get("best_under_odds", 0),
+                "total_line": total_line,
             }
             value = self.value_detector.full_analysis(
                 ml_pred, poisson_pred, market_data, home, away,
@@ -303,10 +314,18 @@ class NHLPredictionPipeline:
                 "poisson_over_prob": poisson_pred.get("over_prob", 0.5),
                 "poisson_under_prob": poisson_pred.get("under_prob", 0.5),
                 "most_likely_score": poisson_pred.get("most_likely_scores", [{}])[0],
-                # Market odds
+                # Market odds — moneyline
                 "best_home_odds": features.get("best_home_odds", 0),
                 "best_away_odds": features.get("best_away_odds", 0),
                 "reg_draw_prob": poisson_pred.get("regulation_draw_prob", 0),
+                # Market odds — spread (puck line)
+                "spread_line": spread_info["spread_line"],
+                "best_home_spread_odds": spread_info["best_home_spread_odds"],
+                "best_away_spread_odds": spread_info["best_away_spread_odds"],
+                # Market odds — totals (over/under)
+                "total_line": total_line,
+                "best_over_odds": totals_info.get("best_over_odds", 0),
+                "best_under_odds": totals_info.get("best_under_odds", 0),
                 # Elo
                 "home_elo": features.get("elo_home", cfg.elo_initial),
                 "away_elo": features.get("elo_away", cfg.elo_initial),
@@ -577,14 +596,29 @@ class NHLPredictionPipeline:
             print(f"    Prediction:  {fav} ({fav_prob:.1%})")
             print(f"    Home:  {hwp:.1%}  |  Away:  {awp:.1%}")
 
-            # Market odds (P1 / X / P2)
+            # ── Market Odds ──
             ho = pred.get("best_home_odds", 0)
             ao = pred.get("best_away_odds", 0)
             draw_p = pred.get("reg_draw_prob", 0)
             if ho and ao:
-                print(f"    Odds:  P1 {ho:+d}  |  X {draw_p:.1%}  |  P2 {ao:+d}")
+                print(f"    Moneyline:  {home} {ho:+d}  |  Draw {draw_p:.1%}  |  {away} {ao:+d}")
             elif draw_p:
                 print(f"    Reg Draw:  {draw_p:.1%}")
+
+            # Puck line (spread)
+            sp_line = pred.get("spread_line", 0)
+            sp_home = pred.get("best_home_spread_odds", 0)
+            sp_away = pred.get("best_away_spread_odds", 0)
+            if sp_home and sp_away:
+                print(f"    Puck Line: {home} {sp_line:+.1f} ({sp_home:+d})  |  "
+                      f"{away} {-sp_line:+.1f} ({sp_away:+d})")
+
+            # Totals (over/under)
+            tl = pred.get("total_line", 0)
+            ov = pred.get("best_over_odds", 0)
+            un = pred.get("best_under_odds", 0)
+            if tl and ov and un:
+                print(f"    Total:    O {tl:.1f} ({ov:+d})  |  U {tl:.1f} ({un:+d})")
 
             print(f"    Expected Total:  {pred['expected_total']:.1f}")
             print(f"    Poisson xG:  {pred['poisson_home_xg']:.2f} — {pred['poisson_away_xg']:.2f}")
