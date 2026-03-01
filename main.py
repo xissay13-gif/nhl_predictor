@@ -40,6 +40,9 @@ from data.collectors.moneypuck import (
 from data.collectors.odds_api import (
     get_consensus_odds, get_totals, get_moneyline,
 )
+from data.collectors.pinnacle import (
+    get_pinnacle_consensus, get_pinnacle_totals, get_pinnacle_odds,
+)
 from data.collectors.dailyfaceoff import get_starting_goalies, get_injuries
 
 # Models
@@ -223,9 +226,17 @@ class NHLPredictionPipeline:
 
         logger.info("Found %d games", len(upcoming))
 
-        # Get odds (filtered to target date only)
-        consensus = get_consensus_odds(target_date=target_date)
-        totals_df = get_totals(target_date=target_date)
+        # Get odds — prefer Pinnacle (sharp, no API key needed), fallback to Odds API
+        logger.info("Fetching Pinnacle odds...")
+        consensus = get_pinnacle_consensus()
+        totals_df = get_pinnacle_totals()
+
+        if consensus.empty:
+            logger.info("Pinnacle unavailable — falling back to Odds API")
+            consensus = get_consensus_odds(target_date=target_date)
+            totals_df = get_totals(target_date=target_date)
+        else:
+            logger.info("Using Pinnacle odds (%d games)", len(consensus))
 
         results = []
 
@@ -272,11 +283,13 @@ class NHLPredictionPipeline:
             }
 
             # Value analysis
+            odds_fmt = features.get("odds_format", "american")
             market_data = {
                 "best_home_odds": features.get("best_home_odds", 0),
                 "best_away_odds": features.get("best_away_odds", 0),
                 "market_total": total_line,
-                "spread_odds": -110,
+                "spread_odds": 1.909 if odds_fmt == "decimal" else -110,
+                "odds_format": odds_fmt,
             }
             value = self.value_detector.full_analysis(
                 ml_pred, poisson_pred, market_data, home, away,
@@ -303,9 +316,10 @@ class NHLPredictionPipeline:
                 "poisson_over_prob": poisson_pred.get("over_prob", 0.5),
                 "poisson_under_prob": poisson_pred.get("under_prob", 0.5),
                 "most_likely_score": poisson_pred.get("most_likely_scores", [{}])[0],
-                # Market odds
+                # Market odds (decimal format)
                 "best_home_odds": features.get("best_home_odds", 0),
                 "best_away_odds": features.get("best_away_odds", 0),
+                "odds_format": odds_fmt,
                 "reg_draw_prob": poisson_pred.get("regulation_draw_prob", 0),
                 # Elo
                 "home_elo": features.get("elo_home", cfg.elo_initial),
@@ -577,12 +591,16 @@ class NHLPredictionPipeline:
             print(f"    Prediction:  {fav} ({fav_prob:.1%})")
             print(f"    Home:  {hwp:.1%}  |  Away:  {awp:.1%}")
 
-            # Market odds (P1 / X / P2)
+            # Market odds (P1 / X / P2) — decimal format
             ho = pred.get("best_home_odds", 0)
             ao = pred.get("best_away_odds", 0)
             draw_p = pred.get("reg_draw_prob", 0)
+            odds_fmt = pred.get("odds_format", "decimal")
             if ho and ao:
-                print(f"    Odds:  P1 {ho:+d}  |  X {draw_p:.1%}  |  P2 {ao:+d}")
+                if odds_fmt == "decimal":
+                    print(f"    Odds:  P1 {ho:.2f}  |  X {draw_p:.1%}  |  P2 {ao:.2f}")
+                else:
+                    print(f"    Odds:  P1 {ho:+d}  |  X {draw_p:.1%}  |  P2 {ao:+d}")
             elif draw_p:
                 print(f"    Reg Draw:  {draw_p:.1%}")
 

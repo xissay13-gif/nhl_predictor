@@ -20,6 +20,13 @@ from utils.helpers import (
     implied_prob, american_to_decimal, kelly_criterion, safe_div,
 )
 
+
+def _decimal_to_implied(decimal_odds: float) -> float:
+    """Convert decimal odds to implied probability."""
+    if decimal_odds <= 0:
+        return 0.0
+    return 1.0 / decimal_odds
+
 logger = logging.getLogger("nhl_predictor.value")
 
 
@@ -42,23 +49,31 @@ class ValueDetector:
         self,
         model_home_prob: float,
         model_away_prob: float,
-        best_home_odds: int,
-        best_away_odds: int,
+        best_home_odds,
+        best_away_odds,
         home_team: str = "",
         away_team: str = "",
+        odds_format: str = "american",
     ) -> list[dict]:
         """
         Find ML value bets.
         Returns list of value opportunities (could be 0, 1, or 2).
+
+        odds_format: "american" (-110, +120) or "decimal" (1.91, 2.20)
         """
         values = []
 
         # Home ML
-        home_implied = implied_prob(best_home_odds)
+        if odds_format == "decimal":
+            home_implied = _decimal_to_implied(best_home_odds)
+            dec_home = best_home_odds
+        else:
+            home_implied = implied_prob(best_home_odds)
+            dec_home = american_to_decimal(best_home_odds)
+
         home_edge = model_home_prob - home_implied
         if home_edge >= self.min_edge:
-            dec = american_to_decimal(best_home_odds)
-            kelly = kelly_criterion(model_home_prob, dec, self.kelly_frac)
+            kelly = kelly_criterion(model_home_prob, dec_home, self.kelly_frac)
             values.append({
                 "market": "moneyline",
                 "side": "home",
@@ -67,19 +82,23 @@ class ValueDetector:
                 "market_implied": round(home_implied, 4),
                 "edge": round(home_edge, 4),
                 "edge_pct": round(home_edge * 100, 2),
-                "odds": best_home_odds,
-                "decimal_odds": round(dec, 3),
+                "decimal_odds": round(dec_home, 3),
                 "kelly_size": round(kelly, 4),
-                "expected_value": round((model_home_prob * dec - 1) * 100, 2),
+                "expected_value": round((model_home_prob * dec_home - 1) * 100, 2),
                 "confidence": _confidence_level(home_edge),
             })
 
         # Away ML
-        away_implied = implied_prob(best_away_odds)
+        if odds_format == "decimal":
+            away_implied = _decimal_to_implied(best_away_odds)
+            dec_away = best_away_odds
+        else:
+            away_implied = implied_prob(best_away_odds)
+            dec_away = american_to_decimal(best_away_odds)
+
         away_edge = model_away_prob - away_implied
         if away_edge >= self.min_edge:
-            dec = american_to_decimal(best_away_odds)
-            kelly = kelly_criterion(model_away_prob, dec, self.kelly_frac)
+            kelly = kelly_criterion(model_away_prob, dec_away, self.kelly_frac)
             values.append({
                 "market": "moneyline",
                 "side": "away",
@@ -88,10 +107,9 @@ class ValueDetector:
                 "market_implied": round(away_implied, 4),
                 "edge": round(away_edge, 4),
                 "edge_pct": round(away_edge * 100, 2),
-                "odds": best_away_odds,
-                "decimal_odds": round(dec, 3),
+                "decimal_odds": round(dec_away, 3),
                 "kelly_size": round(kelly, 4),
-                "expected_value": round((model_away_prob * dec - 1) * 100, 2),
+                "expected_value": round((model_away_prob * dec_away - 1) * 100, 2),
                 "confidence": _confidence_level(away_edge),
             })
 
@@ -101,16 +119,25 @@ class ValueDetector:
         self,
         model_cover_prob: float,
         spread_line: float,
-        spread_odds: int,
+        spread_odds=None,
         side: str = "home",
         team: str = "",
+        odds_format: str = "american",
     ) -> Optional[dict]:
         """Analyze puck line / spread value."""
-        market_implied = implied_prob(spread_odds)
+        if spread_odds is None:
+            spread_odds = -110 if odds_format == "american" else 1.909
+
+        if odds_format == "decimal":
+            market_implied = _decimal_to_implied(spread_odds)
+            dec = spread_odds
+        else:
+            market_implied = implied_prob(spread_odds)
+            dec = american_to_decimal(spread_odds)
+
         edge = model_cover_prob - market_implied
 
         if edge >= self.min_edge:
-            dec = american_to_decimal(spread_odds)
             kelly = kelly_criterion(model_cover_prob, dec, self.kelly_frac)
             return {
                 "market": "spread",
@@ -121,7 +148,6 @@ class ValueDetector:
                 "market_implied": round(market_implied, 4),
                 "edge": round(edge, 4),
                 "edge_pct": round(edge * 100, 2),
-                "odds": spread_odds,
                 "decimal_odds": round(dec, 3),
                 "kelly_size": round(kelly, 4),
                 "expected_value": round((model_cover_prob * dec - 1) * 100, 2),
@@ -134,18 +160,29 @@ class ValueDetector:
         model_over_prob: float,
         model_under_prob: float,
         total_line: float,
-        over_odds: int = -110,
-        under_odds: int = -110,
+        over_odds=None,
+        under_odds=None,
+        odds_format: str = "american",
     ) -> list[dict]:
         """Analyze over/under value."""
+        if over_odds is None:
+            over_odds = -110 if odds_format == "american" else 1.909
+        if under_odds is None:
+            under_odds = -110 if odds_format == "american" else 1.909
+
         values = []
 
         # Over
-        over_implied = implied_prob(over_odds)
+        if odds_format == "decimal":
+            over_implied = _decimal_to_implied(over_odds)
+            dec_over = over_odds
+        else:
+            over_implied = implied_prob(over_odds)
+            dec_over = american_to_decimal(over_odds)
+
         over_edge = model_over_prob - over_implied
         if over_edge >= self.min_edge:
-            dec = american_to_decimal(over_odds)
-            kelly = kelly_criterion(model_over_prob, dec, self.kelly_frac)
+            kelly = kelly_criterion(model_over_prob, dec_over, self.kelly_frac)
             values.append({
                 "market": "total",
                 "side": "over",
@@ -154,19 +191,23 @@ class ValueDetector:
                 "market_implied": round(over_implied, 4),
                 "edge": round(over_edge, 4),
                 "edge_pct": round(over_edge * 100, 2),
-                "odds": over_odds,
-                "decimal_odds": round(dec, 3),
+                "decimal_odds": round(dec_over, 3),
                 "kelly_size": round(kelly, 4),
-                "expected_value": round((model_over_prob * dec - 1) * 100, 2),
+                "expected_value": round((model_over_prob * dec_over - 1) * 100, 2),
                 "confidence": _confidence_level(over_edge),
             })
 
         # Under
-        under_implied = implied_prob(under_odds)
+        if odds_format == "decimal":
+            under_implied = _decimal_to_implied(under_odds)
+            dec_under = under_odds
+        else:
+            under_implied = implied_prob(under_odds)
+            dec_under = american_to_decimal(under_odds)
+
         under_edge = model_under_prob - under_implied
         if under_edge >= self.min_edge:
-            dec = american_to_decimal(under_odds)
-            kelly = kelly_criterion(model_under_prob, dec, self.kelly_frac)
+            kelly = kelly_criterion(model_under_prob, dec_under, self.kelly_frac)
             values.append({
                 "market": "total",
                 "side": "under",
@@ -175,10 +216,9 @@ class ValueDetector:
                 "market_implied": round(under_implied, 4),
                 "edge": round(under_edge, 4),
                 "edge_pct": round(under_edge * 100, 2),
-                "odds": under_odds,
-                "decimal_odds": round(dec, 3),
+                "decimal_odds": round(dec_under, 3),
                 "kelly_size": round(kelly, 4),
-                "expected_value": round((model_under_prob * dec - 1) * 100, 2),
+                "expected_value": round((model_under_prob * dec_under - 1) * 100, 2),
                 "confidence": _confidence_level(under_edge),
             })
 
@@ -228,6 +268,7 @@ class ValueDetector:
 
         # ── Collect all value opportunities (moneyline only) ─────────
         all_values = []
+        odds_fmt = market_data.get("odds_format", "american")
 
         # Moneyline
         best_home = market_data.get("best_home_odds", 0)
@@ -235,7 +276,7 @@ class ValueDetector:
         if best_home and best_away:
             all_values.extend(self.analyze_moneyline(
                 blended_home, blended_away, best_home, best_away,
-                home_team, away_team,
+                home_team, away_team, odds_format=odds_fmt,
             ))
 
         # Sort by edge descending
@@ -290,7 +331,7 @@ def format_value_report(analysis: dict, home_team: str, away_team: str) -> str:
                 lines.append(f"      Spread: {vb['spread_line']}")
             lines.append(f"      Model: {vb['model_prob']:.1%}  |  Market: {vb['market_implied']:.1%}")
             lines.append(f"      Edge:  {vb['edge_pct']:.1f}%  |  EV: {vb['expected_value']:.1f}%")
-            lines.append(f"      Odds:  {vb['odds']}  |  Kelly: {vb['kelly_size']:.2%}")
+            lines.append(f"      Odds:  {vb['decimal_odds']:.3f}  |  Kelly: {vb['kelly_size']:.2%}")
             lines.append("")
     else:
         lines.append("  No value bets detected.")

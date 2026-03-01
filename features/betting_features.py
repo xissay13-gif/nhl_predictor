@@ -44,6 +44,8 @@ def compute_market_features(
     # Market spread (how wide the line is)
     home_range = row.get("home_implied_max", 0.5) - row.get("home_implied_min", 0.5)
 
+    source = row.get("source", "odds_api")
+
     return {
         "market_home_implied": home_imp,
         "market_away_implied": away_imp,
@@ -56,6 +58,7 @@ def compute_market_features(
         "num_bookmakers": row.get("num_books", 0),
         "best_home_odds": row.get("home_best_odds", 0),
         "best_away_odds": row.get("away_best_odds", 0),
+        "odds_format": "decimal" if source == "pinnacle" else "american",
     }
 
 
@@ -154,4 +157,5 @@ def _empty_market() -> dict:
         "num_bookmakers": 0,
         "best_home_odds": 0,
         "best_away_odds": 0,
+        "odds_format": "decimal",
     }
