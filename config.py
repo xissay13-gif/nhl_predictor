@@ -51,7 +51,7 @@ class Config:
     roster_continuity_weight: float = 0.8
 
     # ── Value betting thresholds ──────────────────────────────────────
-    min_edge_pct: float = 6.0        # minimum edge % to flag a value bet (Variant B)
+    min_edge_pct: float = 3.0        # minimum edge % to flag a value bet (lowered per calibration recommendation)
     kelly_fraction: float = 0.40     # aggressive Kelly for 10-15% monthly growth
     max_bet_pct: float = 0.05        # max 5% of bankroll per single bet
 
