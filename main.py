@@ -12,7 +12,7 @@ Usage:
   python main.py tune [--trials 100]            Tune hyperparameters with Optuna
   python main.py calibrate [--seasons ...]       Calibration analysis on OOF predictions
   python main.py track                          Show prediction tracking report
-  python main.py pipeline [--trials 150]        Full pipeline: tune → train → calibrate → sweetspot
+  python main.py pipeline [--trials 300]        Full pipeline: tune → train → calibrate → sweetspot
 """
 
 import sys
@@ -736,8 +736,8 @@ def main():
     # pipeline — full training pipeline: tune → train → calibrate → sweetspot
     pipe_parser = subparsers.add_parser("pipeline",
         help="Run full pipeline: tune → train → calibrate → sweetspot")
-    pipe_parser.add_argument("--trials", type=int, default=150,
-                             help="Number of Optuna trials (default: 150)")
+    pipe_parser.add_argument("--trials", type=int, default=300,
+                             help="Number of Optuna trials (default: 300)")
     pipe_parser.add_argument("--seasons", type=str, default=None,
                              help="Comma-separated seasons (e.g. 20232024,20242025)")
     pipe_parser.add_argument("--engine", type=str, default="auto",
