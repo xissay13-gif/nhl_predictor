@@ -122,6 +122,9 @@ def get_pinnacle_odds() -> list[dict]:
             continue
         if m.get("isLive", False):
             continue
+        # Skip aggregate/daily markets (e.g. "Home Goals (6 Games)")
+        if m.get("units") in ("Daily Total",):
+            continue
 
         participants = m.get("participants", [])
         if len(participants) < 2:
@@ -205,7 +208,17 @@ def get_pinnacle_odds() -> list[dict]:
                         "odds": _american_to_decimal(price),
                     }
             if total_data:
-                odds_by_matchup[matchup_id]["total"] = total_data
+                # Pick the main line: lowest vig (most balanced odds)
+                existing = odds_by_matchup[matchup_id].get("total")
+                if existing is None:
+                    odds_by_matchup[matchup_id]["total"] = total_data
+                else:
+                    # Compare vig: sum of implied probs (closer to 1.0 = lower vig = main line)
+                    def _vig(td):
+                        probs = [1.0 / td[d]["odds"] for d in td if td[d]["odds"] > 0]
+                        return abs(sum(probs) - 1.0) if probs else 99
+                    if _vig(total_data) < _vig(existing):
+                        odds_by_matchup[matchup_id]["total"] = total_data
 
     results = []
     for mid, info in matchups.items():

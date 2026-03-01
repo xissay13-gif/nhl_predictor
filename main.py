@@ -288,6 +288,8 @@ class NHLPredictionPipeline:
                 "best_home_odds": features.get("best_home_odds", 0),
                 "best_away_odds": features.get("best_away_odds", 0),
                 "market_total": total_line,
+                "over_odds": features.get("market_over_odds", 0),
+                "under_odds": features.get("market_under_odds", 0),
                 "spread_odds": 1.909 if odds_fmt == "decimal" else -110,
                 "odds_format": odds_fmt,
             }

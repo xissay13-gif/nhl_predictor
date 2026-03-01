@@ -101,17 +101,23 @@ def compute_totals_features(
     away_team: str,
 ) -> dict:
     """Extract over/under consensus features."""
+    default = {
+        "market_total": 5.5, "market_over_implied": 0.5, "market_under_implied": 0.5,
+        "market_over_odds": 0, "market_under_odds": 0,
+    }
     if totals_df.empty:
-        return {"market_total": 5.5, "market_over_implied": 0.5, "market_under_implied": 0.5}
+        return default
 
     row = _find_matchup_totals(totals_df, home_team, away_team)
     if row is None:
-        return {"market_total": 5.5, "market_over_implied": 0.5, "market_under_implied": 0.5}
+        return default
 
     return {
         "market_total": row.get("total", 5.5),
         "market_over_implied": row.get("over_implied", 0.5),
         "market_under_implied": row.get("under_implied", 0.5),
+        "market_over_odds": row.get("over_odds", 0),
+        "market_under_odds": row.get("under_odds", 0),
     }
 
 
@@ -145,6 +151,8 @@ def _find_matchup_totals(df: pd.DataFrame, home: str, away: str):
                 "total": over.iloc[0]["total"] if not over.empty else 5.5,
                 "over_implied": over["implied"].mean() if not over.empty else 0.5,
                 "under_implied": under["implied"].mean() if not under.empty else 0.5,
+                "over_odds": over["odds"].mean() if (not over.empty and "odds" in over.columns) else 0,
+                "under_odds": under["odds"].mean() if (not under.empty and "odds" in under.columns) else 0,
             }
     return None
 

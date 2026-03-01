@@ -266,7 +266,7 @@ class ValueDetector:
         poisson_cover = poisson_predictions.get("cover_prob", 0.40)
         blended_cover = 0.55 * ml_cover + 0.45 * poisson_cover
 
-        # ── Collect all value opportunities (moneyline only) ─────────
+        # ── Collect all value opportunities ─────────────────────────
         all_values = []
         odds_fmt = market_data.get("odds_format", "american")
 
@@ -277,6 +277,30 @@ class ValueDetector:
             all_values.extend(self.analyze_moneyline(
                 blended_home, blended_away, best_home, best_away,
                 home_team, away_team, odds_format=odds_fmt,
+            ))
+
+        # Totals (over/under)
+        over_odds = market_data.get("over_odds", 0)
+        under_odds = market_data.get("under_odds", 0)
+        total_line = market_data.get("market_total", 5.5)
+        if over_odds and under_odds:
+            # Blend Poisson over/under with ML total prediction
+            poisson_over = poisson_predictions.get("over_prob", 0.5)
+            poisson_under = poisson_predictions.get("under_prob", 0.5)
+
+            # ML-based over/under: if blended_total > line → lean over
+            total_diff = blended_total - total_line
+            # Convert total difference to probability via logistic
+            ml_over = 1.0 / (1.0 + np.exp(-1.5 * total_diff))
+            ml_under = 1.0 - ml_over
+
+            # Blend: Poisson is better at totals, give it more weight
+            blended_over = 0.40 * ml_over + 0.60 * poisson_over
+            blended_under = 0.40 * ml_under + 0.60 * poisson_under
+
+            all_values.extend(self.analyze_total(
+                blended_over, blended_under, total_line,
+                over_odds, under_odds, odds_format=odds_fmt,
             ))
 
         # Sort by edge descending
