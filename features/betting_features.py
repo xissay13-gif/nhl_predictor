@@ -128,8 +128,13 @@ def _find_matchup(df: pd.DataFrame, home: str, away: str):
 
 def _find_matchup_totals(df: pd.DataFrame, home: str, away: str):
     """Find totals for a matchup."""
-    for game_id in df["game_id"].unique():
-        game = df[df["game_id"] == game_id]
+    # Group by game_id if available, otherwise by (home_team, away_team)
+    if "game_id" in df.columns:
+        groups = df.groupby("game_id")
+    else:
+        groups = df.groupby(["home_team", "away_team"])
+
+    for _, game in groups:
         h = str(game.iloc[0].get("home_team", "")).lower()
         a = str(game.iloc[0].get("away_team", "")).lower()
         if (home.lower() in h or h in home.lower()) and \
