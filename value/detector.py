@@ -291,6 +291,9 @@ class ValueDetector:
                 over_prob, under_prob, total_line, over_odds, under_odds,
             ))
 
+        # ── Remove conflicting bets ──────────────────────────────────
+        all_values = _resolve_conflicts(all_values, blended_home)
+
         # Sort by edge descending
         all_values.sort(key=lambda x: x.get("edge_pct", 0), reverse=True)
 
@@ -303,6 +306,57 @@ class ValueDetector:
             "total_value_bets": len(all_values),
             "best_edge": all_values[0] if all_values else None,
         }
+
+
+def _resolve_conflicts(bets: list[dict], model_home_prob: float) -> list[dict]:
+    """
+    Remove logically contradictory value bets.
+
+    Rules:
+    1. Moneyline: if both HOME and AWAY pass edge threshold, keep only the
+       side the model actually favours (higher model_prob → higher edge).
+    2. Spread: drop SPREAD AWAY when ML HOME has value (model believes home
+       wins, so betting away +1.5 contradicts that) and vice-versa.
+    3. Totals: if both OVER and UNDER pass, keep only the one with higher edge.
+    """
+    if not bets:
+        return bets
+
+    # Separate by market
+    ml = [b for b in bets if b["market"] == "moneyline"]
+    spread = [b for b in bets if b["market"] == "spread"]
+    total = [b for b in bets if b["market"] == "total"]
+    other = [b for b in bets if b["market"] not in ("moneyline", "spread", "total")]
+
+    # 1) Moneyline: keep only the favoured side
+    if len(ml) > 1:
+        ml.sort(key=lambda x: x["edge_pct"], reverse=True)
+        ml = [ml[0]]
+
+    # Determine which side the model (and surviving ML bet) favours
+    model_favours_home = model_home_prob >= 0.5
+    ml_side = ml[0]["side"] if ml else ("home" if model_favours_home else "away")
+
+    # 2) Spread: drop spread bets that contradict the ML direction
+    #    - If model favours home → drop SPREAD AWAY (betting underdog covers)
+    #    - If model favours away → drop SPREAD HOME
+    filtered_spread = []
+    for s in spread:
+        if ml_side == "home" and s["side"] == "away":
+            logger.debug("Dropping conflicting SPREAD AWAY (model favours home)")
+            continue
+        if ml_side == "away" and s["side"] == "home":
+            logger.debug("Dropping conflicting SPREAD HOME (model favours away)")
+            continue
+        filtered_spread.append(s)
+    spread = filtered_spread
+
+    # 3) Totals: keep only the side with higher edge
+    if len(total) > 1:
+        total.sort(key=lambda x: x["edge_pct"], reverse=True)
+        total = [total[0]]
+
+    return ml + spread + total + other
 
 
 def _confidence_level(edge: float) -> str:
