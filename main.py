@@ -9,10 +9,10 @@ Usage:
   python main.py elo                            Show current Elo rankings
   python main.py value [--date YYYY-MM-DD]      Find value bets
   python main.py shap                           Show SHAP feature importance
-  python main.py tune [--trials 100]            Tune hyperparameters with Optuna
+  python main.py tune [--trials 300]            Tune hyperparameters with Optuna
   python main.py calibrate [--seasons ...]       Calibration analysis on OOF predictions
   python main.py track                          Show prediction tracking report
-  python main.py pipeline [--trials 150]        Full pipeline: tune → train → calibrate → sweetspot
+  python main.py pipeline [--trials 300]        Full pipeline: tune → train → calibrate → sweetspot
 """
 
 import sys
@@ -693,8 +693,8 @@ def main():
 
     # tune
     tune_parser = subparsers.add_parser("tune", help="Tune hyperparameters with Optuna")
-    tune_parser.add_argument("--trials", type=int, default=100,
-                             help="Number of Optuna trials (default: 100)")
+    tune_parser.add_argument("--trials", type=int, default=300,
+                             help="Number of Optuna trials (default: 300)")
     tune_parser.add_argument("--seasons", type=str, default=None,
                              help="Comma-separated seasons for tuning data")
     tune_parser.add_argument("--engine", type=str, default="auto",
@@ -722,8 +722,8 @@ def main():
     # pipeline — full training pipeline: tune → train → calibrate → sweetspot
     pipe_parser = subparsers.add_parser("pipeline",
         help="Run full pipeline: tune → train → calibrate → sweetspot")
-    pipe_parser.add_argument("--trials", type=int, default=150,
-                             help="Number of Optuna trials (default: 150)")
+    pipe_parser.add_argument("--trials", type=int, default=300,
+                             help="Number of Optuna trials (default: 300)")
     pipe_parser.add_argument("--seasons", type=str, default=None,
                              help="Comma-separated seasons (e.g. 20232024,20242025)")
     pipe_parser.add_argument("--engine", type=str, default="auto",

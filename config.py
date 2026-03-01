@@ -39,7 +39,7 @@ class Config:
     current_season: str = "20252026"
     previous_season: str = "20242025"
     # Multi-season training: list of recent seasons for richer training data
-    training_seasons: list = field(default_factory=lambda: ["20232024", "20242025"])
+    training_seasons: list = field(default_factory=lambda: ["20222023", "20232024", "20242025"])
 
     # ── Model parameters ──────────────────────────────────────────────
     rolling_window_short: int = 5
