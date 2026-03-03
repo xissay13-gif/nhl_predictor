@@ -290,18 +290,40 @@ class ValueDetector:
 
             # ML-based over/under: if blended_total > line → lean over
             total_diff = blended_total - total_line
-            # Convert total difference to probability via logistic
-            ml_over = 1.0 / (1.0 + np.exp(-1.5 * total_diff))
+            # Softer logistic (0.8 instead of 1.5) — totals are hard to predict,
+            # small differences shouldn't create extreme probabilities
+            ml_over = 1.0 / (1.0 + np.exp(-0.8 * total_diff))
             ml_under = 1.0 - ml_over
 
-            # Blend: Poisson is better at totals, give it more weight
-            blended_over = 0.40 * ml_over + 0.60 * poisson_over
-            blended_under = 0.40 * ml_under + 0.60 * poisson_under
+            # Blend: Poisson 55%, ML 25%, market-implied 20%
+            # Including market prior prevents systematic one-side bias
+            if odds_fmt == "decimal":
+                mkt_over_impl = _decimal_to_implied(over_odds) if over_odds > 0 else 0.5
+                mkt_under_impl = _decimal_to_implied(under_odds) if under_odds > 0 else 0.5
+            else:
+                mkt_over_impl = implied_prob(over_odds) if over_odds else 0.5
+                mkt_under_impl = implied_prob(under_odds) if under_odds else 0.5
+            # Remove vig for fair market probs
+            mkt_total_impl = mkt_over_impl + mkt_under_impl
+            if mkt_total_impl > 0:
+                mkt_over_fair = mkt_over_impl / mkt_total_impl
+                mkt_under_fair = mkt_under_impl / mkt_total_impl
+            else:
+                mkt_over_fair = 0.5
+                mkt_under_fair = 0.5
 
+            blended_over = 0.55 * poisson_over + 0.25 * ml_over + 0.20 * mkt_over_fair
+            blended_under = 0.55 * poisson_under + 0.25 * ml_under + 0.20 * mkt_under_fair
+
+            # Higher edge threshold for totals — they're noisier than moneyline
+            totals_min_edge = max(self.min_edge, 0.05)  # at least 5%
+            saved_min = self.min_edge
+            self.min_edge = totals_min_edge
             all_values.extend(self.analyze_total(
                 blended_over, blended_under, total_line,
                 over_odds, under_odds, odds_format=odds_fmt,
             ))
+            self.min_edge = saved_min
 
         # Sort by edge descending
         all_values.sort(key=lambda x: x.get("edge_pct", 0), reverse=True)

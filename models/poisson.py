@@ -200,22 +200,25 @@ class PoissonGoalModel:
 def estimate_xg_from_features(features: dict) -> tuple[float, float]:
     """
     Estimate expected goals from feature vector.
-    Uses a blend of xG data, recent form, and Elo.
+    Uses a blend of xG data, recent form, Elo, and market total as anchor.
+
+    NHL 2024-25 average: ~3.05 goals per team per game (~6.1 total).
     """
+    league_avg = 3.05  # per-team league average
+
     # Primary: xG per game data
     home_xg = features.get("home_xgf_pg", 0)
     away_xg = features.get("away_xgf_pg", 0)
 
-    # Fallback: actual goals per game (NHL 2024-25 average ~3.1)
+    # Fallback: actual goals per game
     if home_xg == 0:
-        home_xg = features.get("home_gf_pg", 3.1)
+        home_xg = features.get("home_gf_pg", league_avg)
     if away_xg == 0:
-        away_xg = features.get("away_gf_pg", 3.1)
+        away_xg = features.get("away_gf_pg", league_avg)
 
     # Adjust for opponent defense
-    home_opp_xga = features.get("away_xga_pg", 3.1)
-    away_opp_xga = features.get("home_xga_pg", 3.1)
-    league_avg = 3.1
+    home_opp_xga = features.get("away_xga_pg", league_avg)
+    away_opp_xga = features.get("home_xga_pg", league_avg)
 
     # Opponent adjustment: if opponent allows more than average, scale up
     home_adj = home_xg * (home_opp_xga / league_avg)
@@ -225,23 +228,38 @@ def estimate_xg_from_features(features: dict) -> tuple[float, float]:
     home_rolling = features.get("home_rolling_5_gf", home_xg)
     away_rolling = features.get("away_rolling_5_gf", away_xg)
 
-    # Weighted blend: 60% season xG, 25% opponent-adjusted, 15% recent form
-    home_final = 0.60 * home_xg + 0.25 * home_adj + 0.15 * home_rolling
-    away_final = 0.60 * away_xg + 0.25 * away_adj + 0.15 * away_rolling
+    # Weighted blend: 55% season xG, 25% opponent-adjusted, 20% recent form
+    home_final = 0.55 * home_xg + 0.25 * home_adj + 0.20 * home_rolling
+    away_final = 0.55 * away_xg + 0.25 * away_adj + 0.20 * away_rolling
 
     # Home advantage bump — only when we have real team data (not defaults)
     has_real_data = (features.get("home_xgf_pg", 0) > 0
                      or features.get("home_gf_pg", 0) > 0)
     if has_real_data:
-        home_final += 0.10  # ~0.1 goal home edge (NHL average is ~0.08-0.12)
+        home_final += 0.10
 
-    # Goalie adjustment
+    # Goalie adjustment (capped to avoid over-suppression)
     home_sv = features.get("home_goalie_save_pct", 0.910)
     away_sv = features.get("away_goalie_save_pct", 0.910)
     avg_sv = 0.910
 
-    # Better goalie => fewer goals against
-    away_final *= (avg_sv / max(home_sv, 0.85))  # home goalie affects away scoring
-    home_final *= (avg_sv / max(away_sv, 0.85))  # away goalie affects home scoring
+    # Cap the adjustment to ±3% so elite goalies don't crush totals
+    home_goalie_factor = max(0.97, min(1.03, avg_sv / max(home_sv, 0.88)))
+    away_goalie_factor = max(0.97, min(1.03, avg_sv / max(away_sv, 0.88)))
+    away_final *= home_goalie_factor
+    home_final *= away_goalie_factor
+
+    # Market-anchor: blend model estimate with market total to reduce
+    # systematic bias. The market is efficient; large deviations are rare.
+    market_total = features.get("market_total", 0)
+    if market_total > 0:
+        model_total = home_final + away_final
+        # 70% model, 30% market — trust model but respect market pricing
+        anchored_total = 0.70 * model_total + 0.30 * market_total
+        # Scale both sides proportionally to match anchored total
+        if model_total > 0:
+            scale = anchored_total / model_total
+            home_final *= scale
+            away_final *= scale
 
     return max(home_final, 0.5), max(away_final, 0.5)
