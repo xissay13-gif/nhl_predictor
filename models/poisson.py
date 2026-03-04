@@ -243,19 +243,20 @@ def estimate_xg_from_features(features: dict) -> tuple[float, float]:
     away_sv = features.get("away_goalie_save_pct", 0.910)
     avg_sv = 0.910
 
-    # Cap the adjustment to ±3% so elite goalies don't crush totals
-    home_goalie_factor = max(0.97, min(1.03, avg_sv / max(home_sv, 0.88)))
-    away_goalie_factor = max(0.97, min(1.03, avg_sv / max(away_sv, 0.88)))
+    # Cap the adjustment to ±5% — enough to matter but not dominate
+    home_goalie_factor = max(0.95, min(1.05, avg_sv / max(home_sv, 0.88)))
+    away_goalie_factor = max(0.95, min(1.05, avg_sv / max(away_sv, 0.88)))
     away_final *= home_goalie_factor
     home_final *= away_goalie_factor
 
-    # Market-anchor: blend model estimate with market total to reduce
-    # systematic bias. The market is efficient; large deviations are rare.
+    # Market-anchor: light blend with market total as sanity check.
+    # With all-situations xG data the model should be well-calibrated,
+    # so keep market weight low to avoid suppressing real edges.
     market_total = features.get("market_total", 0)
     if market_total > 0:
         model_total = home_final + away_final
-        # 70% model, 30% market — trust model but respect market pricing
-        anchored_total = 0.70 * model_total + 0.30 * market_total
+        # 85% model, 15% market — model uses proper all-situations data now
+        anchored_total = 0.85 * model_total + 0.15 * market_total
         # Scale both sides proportionally to match anchored total
         if model_total > 0:
             scale = anchored_total / model_total

@@ -102,6 +102,16 @@ def get_goalie_5v5(season: Optional[str] = None) -> pd.DataFrame:
     return df
 
 
+def get_goalie_all_situations(season: Optional[str] = None) -> pd.DataFrame:
+    """Goalie stats across all situations."""
+    df = get_goalie_stats(season)
+    if df.empty:
+        return df
+    if "situation" in df.columns:
+        return df[df["situation"] == "all"].copy()
+    return df
+
+
 # ── Skater stats ─────────────────────────────────────────────────────
 
 def get_skater_stats(season: Optional[str] = None) -> pd.DataFrame:
@@ -132,11 +142,11 @@ def get_skater_5v5(season: Optional[str] = None) -> pd.DataFrame:
 def get_team_xg_summary(season: Optional[str] = None) -> dict:
     """
     Returns {team_abbrev: {xGF, xGA, CF%, FF%, hdCF%, ...}} for all teams.
-    Tries 5v5 first, falls back to all-situations.
+    Tries all-situations first, falls back to 5v5.
     """
-    df = get_team_5v5(season)
+    df = get_team_all_situations(season)
     if df.empty:
-        df = get_team_all_situations(season)
+        df = get_team_5v5(season)
     if df.empty:
         return {}
 

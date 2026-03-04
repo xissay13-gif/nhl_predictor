@@ -35,7 +35,7 @@ from data.collectors.nhl_api import (
 )
 from data.collectors.moneypuck import (
     get_team_xg_summary, get_goalie_stats, get_skater_stats,
-    get_goalie_5v5, get_team_all_situations,
+    get_goalie_5v5, get_goalie_all_situations, get_team_all_situations,
 )
 from data.collectors.odds_api import (
     get_consensus_odds, get_totals, get_moneyline,
@@ -139,7 +139,7 @@ class NHLPredictionPipeline:
 
         # 4. Goalie stats
         logger.info("  Fetching goalie stats...")
-        goalie_df = get_goalie_5v5(season_year)
+        goalie_df = get_goalie_all_situations(season_year)
         self._goalie_data = {}
         if not goalie_df.empty:
             # Get starting goalies
@@ -373,7 +373,7 @@ class NHLPredictionPipeline:
             # Load previous season data
             prev_standings = get_standings()  # current standings as proxy
             prev_mp = get_team_xg_summary(season_year)
-            prev_goalies_df = get_goalie_5v5(season_year)
+            prev_goalies_df = get_goalie_all_situations(season_year)
             prev_skaters = get_skater_stats(season_year)
 
             # Build goalie lookup
@@ -498,7 +498,7 @@ class NHLPredictionPipeline:
 
             prev_standings = get_standings()
             prev_mp = get_team_xg_summary(season_year)
-            prev_goalies_df = get_goalie_5v5(season_year)
+            prev_goalies_df = get_goalie_all_situations(season_year)
             prev_skaters = get_skater_stats(season_year)
 
             goalie_lookup = {}
