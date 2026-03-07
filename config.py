@@ -51,7 +51,7 @@ class Config:
     roster_continuity_weight: float = 0.8
 
     # ── Value betting thresholds ──────────────────────────────────────
-    min_edge_pct: float = 3.0        # minimum edge % to flag a value bet
+    min_edge_pct: float = 6.0        # minimum edge % to flag a value bet (raised from 3% per backtest)
     kelly_fraction: float = 0.25     # quarter-Kelly for bankroll sizing
 
     # ── Team abbreviations mapping ────────────────────────────────────

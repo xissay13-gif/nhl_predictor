@@ -300,6 +300,12 @@ class NHLPredictionPipeline:
                 ml_pred, poisson_pred, market_data, home, away,
             )
 
+            # Model agreement
+            ml_pick_home = ml_pred["ml_home_win_prob"] > 0.5
+            poisson_pick_home = poisson_pred["home_win_prob"] > 0.5
+            elo_pick_home = features.get("elo_home_win_prob", 0.5) > 0.5
+            models_agree = (ml_pick_home == poisson_pick_home == elo_pick_home)
+
             prediction = {
                 "game_id": game.get("game_id"),
                 "date": target_date,
@@ -315,6 +321,8 @@ class NHLPredictionPipeline:
                 "ml_home_prob": ml_pred["ml_home_win_prob"],
                 "poisson_home_prob": poisson_pred["home_win_prob"],
                 "elo_home_prob": features.get("elo_home_win_prob", 0.5),
+                # Agreement
+                "models_agree": models_agree,
                 # Poisson details
                 "poisson_home_xg": home_xg,
                 "poisson_away_xg": away_xg,
@@ -593,8 +601,16 @@ class NHLPredictionPipeline:
 
             print(f"  {away} @ {home}")
             print(f"  {'─'*50}")
-            print(f"    Prediction:  {fav} ({fav_prob:.1%})")
+            agree = pred.get("models_agree", False)
+            agree_tag = " [ALL AGREE]" if agree else ""
+            print(f"    Prediction:  {fav} ({fav_prob:.1%}){agree_tag}")
             print(f"    Home:  {hwp:.1%}  |  Away:  {awp:.1%}")
+
+            # Per-model breakdown
+            ml_h = pred.get("ml_home_prob", 0.5)
+            poi_h = pred.get("poisson_home_prob", 0.5)
+            elo_h = pred.get("elo_home_prob", 0.5)
+            print(f"    Models:  ML {ml_h:.1%}  |  Poisson {poi_h:.1%}  |  Elo {elo_h:.1%}")
 
             # Market odds (P1 / X / P2) — decimal format
             ho = pred.get("best_home_odds", 0)
@@ -668,6 +684,8 @@ def main():
     pred_parser.add_argument("--date", type=str, default=None, help="Date YYYY-MM-DD")
     pred_parser.add_argument("--min-confidence", type=float, default=None,
                              help="Only show picks with confidence >= this %% (e.g. 60)")
+    pred_parser.add_argument("--agreed-only", action="store_true",
+                             help="Only show games where ML, Poisson and Elo all agree on the winner")
 
     # train
     train_parser = subparsers.add_parser("train", help="Train model")
@@ -778,6 +796,13 @@ def main():
             logger.info("No pre-trained model found — predictions will use Elo + Poisson only")
 
         predictions = pipeline.predict_games(args.date)
+
+        # Filter by model agreement
+        if args.agreed_only:
+            before = len(predictions)
+            predictions = [p for p in predictions if p.get("models_agree", False)]
+            logger.info("Agreement filter: %d/%d games (all 3 models agree)",
+                        len(predictions), before)
 
         # Filter by minimum confidence if specified
         min_conf = args.min_confidence
