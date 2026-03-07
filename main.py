@@ -59,6 +59,9 @@ from value.detector import ValueDetector, format_value_report
 # Tracking
 from tracking.tracker import PredictionTracker
 
+# Backtest
+from backtest.backtest import BacktestEngine
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -701,6 +704,16 @@ def main():
                              choices=["auto", "xgboost", "lightgbm", "catboost"],
                              help="ML engine for tuning (default: auto)")
 
+    # backtest
+    bt_parser = subparsers.add_parser("backtest",
+        help="Walk-forward backtest with comprehensive error analysis")
+    bt_parser.add_argument("--seasons", type=str, default=None,
+                           help="Comma-separated seasons (e.g. 20232024,20242025)")
+    bt_parser.add_argument("--splits", type=int, default=5,
+                           help="Number of TimeSeriesSplit folds (default: 5)")
+    bt_parser.add_argument("--save", type=str, default=None,
+                           help="Save raw backtest results to CSV (path)")
+
     # calibrate
     cal_parser = subparsers.add_parser("calibrate", help="Calibration analysis on OOF predictions")
     cal_parser.add_argument("--seasons", type=str, default=None,
@@ -871,6 +884,22 @@ def main():
         if updated:
             logger.info("Updated %d game results", updated)
         pipeline.tracker.print_report()
+
+    elif args.command == "backtest":
+        seasons = args.seasons.split(",") if args.seasons else None
+        engine = BacktestEngine()
+        logger.info("Running walk-forward backtest...")
+        df = engine.run(seasons=seasons, n_splits=args.splits)
+        if df.empty:
+            logger.error("Backtest produced no results")
+            return
+
+        if args.save:
+            df.to_csv(args.save, index=False)
+            logger.info("Raw results saved to %s", args.save)
+
+        report = engine.error_analysis()
+        engine.print_report(report)
 
     elif args.command == "calibrate":
         seasons = args.seasons.split(",") if args.seasons else None
